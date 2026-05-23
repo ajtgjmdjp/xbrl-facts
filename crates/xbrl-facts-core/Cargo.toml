@@ -1,0 +1,18 @@
+[package]
+name = "xbrl-facts-core"
+description = "XBRL/iXBRL parser with provenance-rich normalized financial facts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quick-xml = { version = "0.37", features = ["serialize"] }
+rust_decimal = { version = "1", features = ["serde-str"] }
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"

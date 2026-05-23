@@ -1,0 +1,14 @@
+[package]
+name = "xbrl-facts-cli"
+description = "CLI for xbrl-facts: parse, inspect, and export XBRL financial data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+xbrl-facts-core = { path = "../xbrl-facts-core" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
