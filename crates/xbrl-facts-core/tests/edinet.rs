@@ -7,7 +7,8 @@
 use std::path::PathBuf;
 
 use xbrl_facts_core::{
-    NormalizedValue, QName, TaxonomyResolver, normalize_facts, parse_instance_set,
+    LabelLinkbase, NormalizedValue, QName, SchemaIndex, TaxonomyResolver, normalize_facts,
+    parse_instance_set,
 };
 
 struct NoLabels;
@@ -59,6 +60,40 @@ fn parses_edinet_ixds_without_errors() {
         .get("JPY")
         .expect("JPY unit defined in header");
     assert_eq!(jpy.numerator[0].local_name, "JPY");
+}
+
+#[test]
+fn resolves_filer_specific_labels_from_linkbase() {
+    let dir = fixture_dir();
+    let xsd = dir.join("jpcrp030000-asr-001_E00355-000_2025-03-31_01_2025-06-26.xsd");
+    let lab = dir.join("jpcrp030000-asr-001_E00355-000_2025-03-31_01_2025-06-26_lab.xml");
+
+    let mut schema = SchemaIndex::new();
+    schema
+        .ingest_schema(
+            xsd.file_name().unwrap().to_str().unwrap(),
+            &std::fs::read(&xsd).expect("schema fixture"),
+        )
+        .expect("schema parses");
+
+    let mut linkbase = LabelLinkbase::new();
+    linkbase
+        .ingest(&std::fs::read(&lab).expect("lab fixture"), &schema)
+        .expect("linkbase parses");
+
+    // Filer-specific concept that has a Japanese label in the linkbase.
+    let qname = QName {
+        namespace_uri: Some(
+            "http://disclosure.edinet-fsa.go.jp/jpcrp030000/asr/001/E00355-000/2025-03-31/01/2025-06-26"
+                .into(),
+        ),
+        prefix: Some("jpcrp030000-asr_E00355-000".into()),
+        local_name: "IdleAssetExpensesNOE".into(),
+    };
+    assert_eq!(
+        linkbase.label(&qname, None, Some("ja")).as_deref(),
+        Some("遊休資産諸費用")
+    );
 }
 
 #[test]

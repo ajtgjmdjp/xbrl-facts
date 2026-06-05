@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use xbrl_facts_core::{
-    QName, RawFact, TaxonomyResolver, normalize_facts, parse_instance, parse_instance_set,
+    LabelLinkbase, QName, RawFact, SchemaIndex, TaxonomyResolver, normalize_facts, parse_instance,
+    parse_instance_set,
 };
 
 #[derive(Parser)]
@@ -42,6 +43,19 @@ enum Commands {
         /// Fact output mode for JSONL output
         #[arg(long, default_value = "raw")]
         facts: FactOutput,
+
+        /// Taxonomy schema file (.xsd). May be repeated. Required for label
+        /// resolution; without it `--labels` cannot map fragments to QNames.
+        #[arg(long = "schema", value_name = "FILE", action = clap::ArgAction::Append)]
+        schemas: Vec<PathBuf>,
+
+        /// Label linkbase file (.xml). May be repeated.
+        #[arg(long = "labels", value_name = "FILE", action = clap::ArgAction::Append)]
+        labels: Vec<PathBuf>,
+
+        /// Preferred language for label lookup (e.g. "ja", "en")
+        #[arg(long = "lang", default_value = "ja")]
+        lang: String,
     },
     /// Inspect parsed JSONL facts
     Inspect {
@@ -79,6 +93,9 @@ fn main() -> anyhow::Result<()> {
             output,
             format,
             facts,
+            schemas,
+            labels,
+            lang,
         } => {
             let instance = if path.is_dir() {
                 let inputs = collect_ixds_inputs(&path)?;
@@ -91,6 +108,33 @@ fn main() -> anyhow::Result<()> {
                     .with_context(|| format!("failed to read input file {}", path.display()))?;
                 parse_instance(&input)?
             };
+
+            let taxonomy: Box<dyn TaxonomyResolver> = if labels.is_empty() {
+                Box::new(NoLabels)
+            } else {
+                let mut schema = SchemaIndex::new();
+                for path in &schemas {
+                    let bytes = std::fs::read(path)
+                        .with_context(|| format!("failed to read schema {}", path.display()))?;
+                    let href = path
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or_default();
+                    schema.ingest_schema(href, &bytes)?;
+                }
+                let mut linkbase = LabelLinkbase::new();
+                for path in &labels {
+                    let bytes = std::fs::read(path).with_context(|| {
+                        format!("failed to read label linkbase {}", path.display())
+                    })?;
+                    linkbase.ingest(&bytes, &schema)?;
+                }
+                Box::new(LangPreferringResolver {
+                    linkbase,
+                    lang: lang.clone(),
+                })
+            };
+
             let rendered = match format {
                 OutputFormat::Json => serde_json::to_string_pretty(&instance)?,
                 OutputFormat::Jsonl => match facts {
@@ -100,13 +144,15 @@ fn main() -> anyhow::Result<()> {
                         .map(serde_json::to_string)
                         .collect::<Result<Vec<_>, _>>()?
                         .join("\n"),
-                    FactOutput::Normalized => normalize_facts(&instance, &NoLabels, "stdin")
-                        .into_iter()
-                        .map(|fact| -> anyhow::Result<String> {
-                            Ok(serde_json::to_string(&fact?)?)
-                        })
-                        .collect::<anyhow::Result<Vec<_>>>()?
-                        .join("\n"),
+                    FactOutput::Normalized => {
+                        normalize_facts(&instance, taxonomy.as_ref(), "stdin")
+                            .into_iter()
+                            .map(|fact| -> anyhow::Result<String> {
+                                Ok(serde_json::to_string(&fact?)?)
+                            })
+                            .collect::<anyhow::Result<Vec<_>>>()?
+                            .join("\n")
+                    }
                 },
             };
 
@@ -158,6 +204,18 @@ fn collect_ixds_inputs(dir: &std::path::Path) -> anyhow::Result<Vec<Vec<u8>>> {
         .into_iter()
         .map(|p| std::fs::read(&p).with_context(|| format!("failed to read {}", p.display())))
         .collect()
+}
+
+struct LangPreferringResolver {
+    linkbase: LabelLinkbase,
+    lang: String,
+}
+
+impl TaxonomyResolver for LangPreferringResolver {
+    fn label(&self, name: &QName, role: Option<&str>, lang: Option<&str>) -> Option<String> {
+        let preferred = lang.unwrap_or(&self.lang);
+        self.linkbase.label(name, role, Some(preferred))
+    }
 }
 
 struct NoLabels;
