@@ -1,0 +1,24 @@
+<xbrli:xbrl
+    xmlns:xbrli="http://www.xbrl.org/2003/instance"
+    xmlns:link="http://www.xbrl.org/2003/linkbase"
+    xmlns:xlink="http://www.w3.org/1999/xlink"
+    xmlns:iso4217="http://www.xbrl.org/2003/iso4217"
+    xmlns:ex="http://example.com/taxonomy">
+  <xbrli:context id="ctx1">
+    <xbrli:entity>
+      <xbrli:identifier scheme="http://example.com/entity">E00001</xbrli:identifier>
+    </xbrli:entity>
+    <xbrli:period>
+      <xbrli:instant>2025-03-31</xbrli:instant>
+    </xbrli:period>
+  </xbrli:context>
+  <xbrli:unit id="JPY">
+    <xbrli:measure>iso4217:JPY</xbrli:measure>
+  </xbrli:unit>
+  <ex:NetSales id="f1" contextRef="ctx1" unitRef="JPY" decimals="0">1000</ex:NetSales>
+  <link:footnoteLink xlink:type="extended">
+    <link:loc xlink:type="locator" xlink:href="#f1" xlink:label="fact_f1"/>
+    <link:footnote xlink:type="resource" xlink:label="fn1" xlink:role="http://www.xbrl.org/2003/role/footnote" xml:lang="en">Includes overseas sales.</link:footnote>
+    <link:footnoteArc xlink:type="arc" xlink:arcrole="http://www.xbrl.org/2003/arcrole/fact-footnote" xlink:from="fact_f1" xlink:to="fn1"/>
+  </link:footnoteLink>
+</xbrli:xbrl>

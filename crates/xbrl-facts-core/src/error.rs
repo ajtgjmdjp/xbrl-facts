@@ -21,6 +21,9 @@ pub enum XbrlError {
     #[error("unsupported inline transform: {format}")]
     UnsupportedInlineTransform { format: String },
 
+    #[error("not implemented: {feature}")]
+    NotImplemented { feature: &'static str },
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -33,8 +36,6 @@ pub enum XbrlError {
 
 impl From<rust_decimal::Error> for XbrlError {
     fn from(e: rust_decimal::Error) -> Self {
-        Self::InvalidDecimal {
-            raw: e.to_string(),
-        }
+        Self::InvalidDecimal { raw: e.to_string() }
     }
 }

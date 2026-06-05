@@ -1,0 +1,33 @@
+<html
+    xmlns="http://www.w3.org/1999/xhtml"
+    xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"
+    xmlns:xbrli="http://www.xbrl.org/2003/instance"
+    xmlns:iso4217="http://www.xbrl.org/2003/iso4217"
+    xmlns:ex="http://example.com/taxonomy">
+  <head>
+    <ix:hidden>
+      <ix:resources>
+        <xbrli:context id="c1">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://example.com/entity">E00001</xbrli:identifier>
+          </xbrli:entity>
+          <xbrli:period>
+            <xbrli:instant>2025-03-31</xbrli:instant>
+          </xbrli:period>
+        </xbrli:context>
+        <xbrli:unit id="JPY">
+          <xbrli:measure>iso4217:JPY</xbrli:measure>
+        </xbrli:unit>
+        <ix:nonFraction name="ex:HiddenLoss" contextRef="c1" unitRef="JPY" decimals="0" sign="-">42</ix:nonFraction>
+      </ix:resources>
+    </ix:hidden>
+  </head>
+  <body>
+    <p>Revenue: <ix:nonFraction name="ex:Revenue" contextRef="c1" unitRef="JPY" decimals="-3" scale="3">1,234</ix:nonFraction></p>
+    <p>EU amount: <ix:nonFraction name="ex:EuAmount" contextRef="c1" unitRef="JPY" decimals="2" format="ixt:numcommadecimal">1.234,56</ix:nonFraction></p>
+    <p>Dash amount: <ix:nonFraction name="ex:DashAmount" contextRef="c1" unitRef="JPY" decimals="0" format="ixt:zerodash">-</ix:nonFraction></p>
+    <p>Parenthesized loss: <ix:nonFraction name="ex:ParenthesizedLoss" contextRef="c1" unitRef="JPY" decimals="0">(1,234)</ix:nonFraction></p>
+    <p>Name: <ix:nonNumeric name="ex:CompanyName" contextRef="c1" xml:lang="ja" continuedAt="name-cont-1">Example</ix:nonNumeric></p>
+    <ix:continuation id="name-cont-1">株式会社</ix:continuation>
+  </body>
+</html>

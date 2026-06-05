@@ -1,0 +1,25 @@
+<xbrli:xbrl
+    xmlns:xbrli="http://www.xbrl.org/2003/instance"
+    xmlns:link="http://www.xbrl.org/2003/linkbase"
+    xmlns:xlink="http://www.w3.org/1999/xlink"
+    xmlns:xbrldi="http://xbrl.org/2006/xbrldi"
+    xmlns:iso4217="http://www.xbrl.org/2003/iso4217"
+    xmlns:ex="http://example.com/taxonomy">
+  <link:schemaRef xlink:href="example.xsd" xlink:type="simple"/>
+  <xbrli:context id="ctx1">
+    <xbrli:entity>
+      <xbrli:identifier scheme="http://example.com/entity">E00001</xbrli:identifier>
+      <xbrli:segment>
+        <xbrldi:explicitMember dimension="ex:ConsolidatedAxis">ex:ConsolidatedMember</xbrldi:explicitMember>
+      </xbrli:segment>
+    </xbrli:entity>
+    <xbrli:period>
+      <xbrli:instant>2025-03-31</xbrli:instant>
+    </xbrli:period>
+  </xbrli:context>
+  <xbrli:unit id="JPY">
+    <xbrli:measure>iso4217:JPY</xbrli:measure>
+  </xbrli:unit>
+  <ex:NetSales id="f1" contextRef="ctx1" unitRef="JPY" decimals="0">1000000</ex:NetSales>
+  <ex:CompanyName contextRef="ctx1" xml:lang="ja">Example株式会社</ex:CompanyName>
+</xbrli:xbrl>

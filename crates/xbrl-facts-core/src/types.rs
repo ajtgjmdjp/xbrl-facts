@@ -1,17 +1,47 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 // --- Qualified Name ---
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct QName {
     pub namespace_uri: Option<String>,
     pub prefix: Option<String>,
     pub local_name: String,
+}
+
+impl PartialEq for QName {
+    fn eq(&self, other: &Self) -> bool {
+        self.namespace_uri == other.namespace_uri && self.local_name == other.local_name
+    }
+}
+
+impl Eq for QName {}
+
+impl PartialOrd for QName {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QName {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.namespace_uri
+            .cmp(&other.namespace_uri)
+            .then_with(|| self.local_name.cmp(&other.local_name))
+    }
+}
+
+impl Hash for QName {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.namespace_uri.hash(state);
+        self.local_name.hash(state);
+    }
 }
 
 impl fmt::Display for QName {
@@ -119,7 +149,7 @@ pub enum Period {
 #[non_exhaustive]
 pub enum ContextElement {
     ExplicitDimension { dimension: QName, member: QName },
-    TypedDimension { dimension: QName, value: String },
+    TypedDimension { dimension: QName, raw_xml: String },
     Other { raw_xml: String },
 }
 
@@ -156,7 +186,7 @@ pub struct NormalizedFact {
     pub period: Period,
     pub entity: Entity,
     pub unit: Option<Unit>,
-    pub dimensions: BTreeMap<QName, DimensionMember>,
+    pub dimensions: Vec<Dimension>,
     pub provenance: Provenance,
 }
 
@@ -164,9 +194,23 @@ pub struct NormalizedFact {
 #[serde(rename_all = "snake_case", tag = "type")]
 #[non_exhaustive]
 pub enum NormalizedValue {
-    Numeric { raw: String, decimal: Option<Decimal>, decimals: Option<i32> },
-    Text { value: String, lang: Option<String> },
+    Numeric {
+        raw: String,
+        decimal: Option<Decimal>,
+        decimals: Option<Decimals>,
+    },
+    Text {
+        value: String,
+        lang: Option<String>,
+    },
     Nil,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct Dimension {
+    pub dimension: QName,
+    pub member: DimensionMember,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,7 +218,7 @@ pub enum NormalizedValue {
 #[non_exhaustive]
 pub enum DimensionMember {
     Explicit { member: QName },
-    Typed { value: String },
+    Typed { raw_xml: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +281,21 @@ mod tests {
     }
 
     #[test]
+    fn qname_identity_ignores_prefix() {
+        let left = QName {
+            namespace_uri: Some("http://example.com".into()),
+            prefix: Some("a".into()),
+            local_name: "NetSales".into(),
+        };
+        let right = QName {
+            namespace_uri: Some("http://example.com".into()),
+            prefix: Some("b".into()),
+            local_name: "NetSales".into(),
+        };
+        assert_eq!(left, right);
+    }
+
+    #[test]
     fn raw_fact_roundtrip_json() {
         let fact = RawFact {
             id: Some("fact1".into()),
@@ -288,5 +347,66 @@ mod tests {
         };
         assert_eq!(ctx.segment.len(), 1);
         assert!(ctx.scenario.is_empty());
+    }
+
+    #[test]
+    fn normalized_fact_with_dimensions_serializes_to_json() {
+        let fact = NormalizedFact {
+            name: QName {
+                namespace_uri: Some("http://example.com".into()),
+                prefix: Some("ex".into()),
+                local_name: "NetSales".into(),
+            },
+            label: Some("Net sales".into()),
+            value: NormalizedValue::Numeric {
+                raw: "1000000".into(),
+                decimal: Some(Decimal::new(1_000_000, 0)),
+                decimals: Some(Decimals::Value { n: 0 }),
+            },
+            period: Period::Instant {
+                date: "2025-03-31".into(),
+            },
+            entity: Entity {
+                scheme: "http://disclosure.edinet-fsa.go.jp".into(),
+                identifier: "E02144".into(),
+            },
+            unit: Some(Unit {
+                id: "JPY".into(),
+                numerator: vec![QName {
+                    namespace_uri: Some("http://www.xbrl.org/2003/iso4217".into()),
+                    prefix: Some("iso4217".into()),
+                    local_name: "JPY".into(),
+                }],
+                denominator: vec![],
+            }),
+            dimensions: vec![Dimension {
+                dimension: QName {
+                    namespace_uri: Some("http://example.com".into()),
+                    prefix: Some("ex".into()),
+                    local_name: "ConsolidatedAxis".into(),
+                },
+                member: DimensionMember::Explicit {
+                    member: QName {
+                        namespace_uri: Some("http://example.com".into()),
+                        prefix: Some("ex".into()),
+                        local_name: "ConsolidatedMember".into(),
+                    },
+                },
+            }],
+            provenance: Provenance {
+                doc_id: "doc1".into(),
+                accession: None,
+                source_url: None,
+                element_id: None,
+                fact_id: Some("fact1".into()),
+                context_ref: "ctx1".into(),
+                byte_range: None,
+            },
+        };
+
+        let json = serde_json::to_string(&fact).unwrap();
+        assert!(json.contains("dimensions"));
+        let back: NormalizedFact = serde_json::from_str(&json).unwrap();
+        assert_eq!(fact, back);
     }
 }

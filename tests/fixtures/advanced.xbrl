@@ -1,0 +1,31 @@
+<xbrli:xbrl
+    xmlns:xbrli="http://www.xbrl.org/2003/instance"
+    xmlns:xbrldi="http://xbrl.org/2006/xbrldi"
+    xmlns:iso4217="http://www.xbrl.org/2003/iso4217"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xmlns:ex="http://example.com/taxonomy">
+  <xbrli:context id="ctx_typed">
+    <xbrli:entity>
+      <xbrli:identifier scheme="http://example.com/entity">E00001</xbrli:identifier>
+      <xbrli:scenario>
+        <xbrldi:typedMember dimension="ex:StoreAxis"><ex:StoreCode>001</ex:StoreCode></xbrldi:typedMember>
+      </xbrli:scenario>
+    </xbrli:entity>
+    <xbrli:period>
+      <xbrli:startDate>2024-04-01</xbrli:startDate>
+      <xbrli:endDate>2025-03-31</xbrli:endDate>
+    </xbrli:period>
+  </xbrli:context>
+  <xbrli:unit id="JPYPerShare">
+    <xbrli:divide>
+      <xbrli:unitNumerator>
+        <xbrli:measure>iso4217:JPY</xbrli:measure>
+      </xbrli:unitNumerator>
+      <xbrli:unitDenominator>
+        <xbrli:measure>xbrli:shares</xbrli:measure>
+      </xbrli:unitDenominator>
+    </xbrli:divide>
+  </xbrli:unit>
+  <ex:EarningsPerShare contextRef="ctx_typed" unitRef="JPYPerShare" decimals="INF">123.45</ex:EarningsPerShare>
+  <ex:OptionalDisclosure contextRef="ctx_typed" xsi:nil="true"/>
+</xbrli:xbrl>

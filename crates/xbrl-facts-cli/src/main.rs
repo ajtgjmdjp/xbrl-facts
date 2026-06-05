@@ -1,9 +1,15 @@
 use std::path::PathBuf;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
+use xbrl_facts_core::{QName, RawFact, TaxonomyResolver, normalize_facts, parse_instance};
 
 #[derive(Parser)]
-#[command(name = "xbrl-facts", version, about = "Parse and inspect XBRL financial filings")]
+#[command(
+    name = "xbrl-facts",
+    version,
+    about = "Parse and inspect XBRL financial filings"
+)]
 struct Cli {
     /// Enable verbose output
     #[arg(short, long, global = true)]
@@ -27,6 +33,10 @@ enum Commands {
         /// Output format
         #[arg(short, long, default_value = "jsonl")]
         format: OutputFormat,
+
+        /// Fact output mode for JSONL output
+        #[arg(long, default_value = "raw")]
+        facts: FactOutput,
     },
     /// Inspect parsed JSONL facts
     Inspect {
@@ -45,6 +55,12 @@ enum OutputFormat {
     Json,
 }
 
+#[derive(Clone, clap::ValueEnum)]
+enum FactOutput {
+    Raw,
+    Normalized,
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -56,17 +72,66 @@ fn main() -> anyhow::Result<()> {
         Commands::Parse {
             path,
             output,
-            format: _,
+            format,
+            facts,
         } => {
-            let dest = output
-                .as_ref()
-                .map_or("stdout".to_string(), |p| p.display().to_string());
-            eprintln!("TODO: parse {} -> {dest}", path.display());
+            let input = std::fs::read(&path)
+                .with_context(|| format!("failed to read input file {}", path.display()))?;
+            let instance = parse_instance(&input)?;
+            let rendered = match format {
+                OutputFormat::Json => serde_json::to_string_pretty(&instance)?,
+                OutputFormat::Jsonl => match facts {
+                    FactOutput::Raw => instance
+                        .facts
+                        .iter()
+                        .map(serde_json::to_string)
+                        .collect::<Result<Vec<_>, _>>()?
+                        .join("\n"),
+                    FactOutput::Normalized => normalize_facts(&instance, &NoLabels, "stdin")
+                        .into_iter()
+                        .map(|fact| -> anyhow::Result<String> {
+                            Ok(serde_json::to_string(&fact?)?)
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?
+                        .join("\n"),
+                },
+            };
+
+            if let Some(output) = output {
+                std::fs::write(&output, rendered)
+                    .with_context(|| format!("failed to write output file {}", output.display()))?;
+            } else {
+                println!("{rendered}");
+            }
         }
         Commands::Inspect { path, concept } => {
-            eprintln!("TODO: inspect {} concept={concept:?}", path.display());
+            let input = std::fs::read_to_string(&path)
+                .with_context(|| format!("failed to read JSONL file {}", path.display()))?;
+            for (line_no, line) in input.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let fact: RawFact = serde_json::from_str(line).with_context(|| {
+                    format!("invalid JSONL at {}:{}", path.display(), line_no + 1)
+                })?;
+                if concept
+                    .as_ref()
+                    .is_some_and(|name| fact.name.local_name != *name)
+                {
+                    continue;
+                }
+                println!("{}", serde_json::to_string(&fact)?);
+            }
         }
     }
 
     Ok(())
+}
+
+struct NoLabels;
+
+impl TaxonomyResolver for NoLabels {
+    fn label(&self, _name: &QName, _role: Option<&str>, _lang: Option<&str>) -> Option<String> {
+        None
+    }
 }
