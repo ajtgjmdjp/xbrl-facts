@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use xbrl_facts_core::{QName, RawFact, TaxonomyResolver, normalize_facts, parse_instance};
+use xbrl_facts_core::{
+    QName, RawFact, TaxonomyResolver, normalize_facts, parse_instance, parse_instance_set,
+};
 
 #[derive(Parser)]
 #[command(
@@ -21,9 +23,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Parse an XBRL/iXBRL file and output facts
+    /// Parse an XBRL/iXBRL file or directory and output facts.
+    ///
+    /// If `path` is a directory, every `.htm`/`.xhtml`/`.xbrl` file inside is
+    /// merged as one Inline XBRL Document Set (IXDS).
     Parse {
-        /// Path to XBRL or iXBRL file
+        /// Path to XBRL/iXBRL file, or directory containing an IXDS
         path: PathBuf,
 
         /// Output file (default: stdout)
@@ -75,9 +80,17 @@ fn main() -> anyhow::Result<()> {
             format,
             facts,
         } => {
-            let input = std::fs::read(&path)
-                .with_context(|| format!("failed to read input file {}", path.display()))?;
-            let instance = parse_instance(&input)?;
+            let instance = if path.is_dir() {
+                let inputs = collect_ixds_inputs(&path)?;
+                if inputs.is_empty() {
+                    anyhow::bail!("no XBRL/iXBRL files found in {}", path.display());
+                }
+                parse_instance_set(inputs.iter().map(|b| b.as_slice()))?
+            } else {
+                let input = std::fs::read(&path)
+                    .with_context(|| format!("failed to read input file {}", path.display()))?;
+                parse_instance(&input)?
+            };
             let rendered = match format {
                 OutputFormat::Json => serde_json::to_string_pretty(&instance)?,
                 OutputFormat::Jsonl => match facts {
@@ -126,6 +139,25 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn collect_ixds_inputs(dir: &std::path::Path) -> anyhow::Result<Vec<Vec<u8>>> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read directory {}", dir.display()))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.is_file())
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| matches!(e.to_ascii_lowercase().as_str(), "htm" | "xhtml" | "xbrl"))
+                .unwrap_or(false)
+        })
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|p| std::fs::read(&p).with_context(|| format!("failed to read {}", p.display())))
+        .collect()
 }
 
 struct NoLabels;

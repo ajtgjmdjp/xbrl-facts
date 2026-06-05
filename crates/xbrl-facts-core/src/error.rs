@@ -21,6 +21,9 @@ pub enum XbrlError {
     #[error("unsupported inline transform: {format}")]
     UnsupportedInlineTransform { format: String },
 
+    #[error("conflicting {kind} '{id}' across IXDS members")]
+    IxdsConflict { kind: &'static str, id: String },
+
     #[error("not implemented: {feature}")]
     NotImplemented { feature: &'static str },
 

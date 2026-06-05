@@ -21,6 +21,65 @@ pub fn parse_instance(input: &[u8]) -> Result<InstanceDocument, XbrlError> {
     parser.parse()
 }
 
+/// Parse an Inline XBRL Document Set (IXDS): multiple iXBRL files that share
+/// a single virtual instance. Contexts and units must be unique across the
+/// set; conflicting definitions return [`XbrlError::IxdsConflict`].
+///
+/// Per Inline XBRL 1.1 §5, EDINET filings split content across multiple
+/// `*_ixbrl.htm` files where the `0000000_header_*.htm` typically defines all
+/// contexts/units in `ix:resources` while sibling files carry facts.
+pub fn parse_instance_set<I>(inputs: I) -> Result<InstanceDocument, XbrlError>
+where
+    I: IntoIterator,
+    I::Item: AsRef<[u8]>,
+{
+    let mut merged = InstanceDocument {
+        schema_refs: Vec::new(),
+        contexts: BTreeMap::new(),
+        units: BTreeMap::new(),
+        facts: Vec::new(),
+        footnotes: Vec::new(),
+    };
+
+    for input in inputs {
+        let doc = parse_instance(input.as_ref())?;
+        for schema_ref in doc.schema_refs {
+            if !merged.schema_refs.contains(&schema_ref) {
+                merged.schema_refs.push(schema_ref);
+            }
+        }
+        for (id, ctx) in doc.contexts {
+            match merged.contexts.get(&id) {
+                None => {
+                    merged.contexts.insert(id, ctx);
+                }
+                Some(existing) if existing == &ctx => {}
+                Some(_) => {
+                    return Err(XbrlError::IxdsConflict {
+                        kind: "context",
+                        id,
+                    });
+                }
+            }
+        }
+        for (id, unit) in doc.units {
+            match merged.units.get(&id) {
+                None => {
+                    merged.units.insert(id, unit);
+                }
+                Some(existing) if existing == &unit => {}
+                Some(_) => {
+                    return Err(XbrlError::IxdsConflict { kind: "unit", id });
+                }
+            }
+        }
+        merged.facts.extend(doc.facts);
+        merged.footnotes.extend(doc.footnotes);
+    }
+
+    Ok(merged)
+}
+
 pub trait TaxonomyResolver {
     fn label(
         &self,
@@ -139,7 +198,7 @@ struct InstanceParser<'a> {
     doc: InstanceDocument,
     context: Option<ContextBuilder>,
     unit: Option<UnitBuilder>,
-    fact: Option<FactBuilder>,
+    fact_stack: Vec<FactBuilder>,
     text_target: Option<TextTarget>,
     hidden_depth: usize,
     continuations: BTreeMap<String, Continuation>,
@@ -164,7 +223,7 @@ impl<'a> InstanceParser<'a> {
             },
             context: None,
             unit: None,
-            fact: None,
+            fact_stack: Vec::new(),
             text_target: None,
             hidden_depth: 0,
             continuations: BTreeMap::new(),
@@ -265,8 +324,17 @@ impl<'a> InstanceParser<'a> {
             return Ok(true);
         }
 
-        if self.fact.is_some() {
-            if let Some(fact) = &mut self.fact {
+        // Inline facts (ix:nonFraction/ix:nonNumeric) can nest inside other
+        // inline facts, so check this before bumping the parent's depth.
+        if let Some(fact) = FactBuilder::inline(&qname, &attrs, &namespaces, self.hidden_depth > 0)?
+        {
+            self.fact_stack.push(fact);
+            self.text_target = Some(TextTarget::Fact);
+            return Ok(true);
+        }
+
+        if !self.fact_stack.is_empty() {
+            if let Some(fact) = self.fact_stack.last_mut() {
                 fact.depth += 1;
             }
             return Ok(true);
@@ -296,15 +364,9 @@ impl<'a> InstanceParser<'a> {
             return Ok(true);
         }
 
-        if let Some(fact) = FactBuilder::inline(&qname, &attrs, &namespaces, self.hidden_depth > 0)?
-        {
-            self.fact = Some(fact);
-            self.text_target = Some(TextTarget::Fact);
-            return Ok(true);
-        }
-
         if let Some(context_ref) = attrs.get("contextRef").cloned() {
-            self.fact = Some(FactBuilder::new(qname, context_ref, &attrs)?);
+            self.fact_stack
+                .push(FactBuilder::new(qname, context_ref, &attrs)?);
             self.text_target = Some(TextTarget::Fact);
         }
 
@@ -323,13 +385,15 @@ impl<'a> InstanceParser<'a> {
             });
         };
 
-        if let Some(fact) = &mut self.fact {
-            if fact.depth > 0 {
-                fact.depth -= 1;
+        if let Some(top) = self.fact_stack.last_mut() {
+            if top.depth > 0 {
+                top.depth -= 1;
             } else {
-                let finished = self.fact.take().expect("fact exists").finish();
+                let finished = self.fact_stack.pop().expect("fact exists").finish();
                 self.doc.facts.push(finished);
-                self.text_target = None;
+                if self.fact_stack.is_empty() {
+                    self.text_target = None;
+                }
             }
             return Ok(());
         }
@@ -377,8 +441,11 @@ impl<'a> InstanceParser<'a> {
             return Ok(());
         }
 
-        if let Some(fact) = &mut self.fact {
-            fact.text.push_str(text.trim());
+        if !self.fact_stack.is_empty() {
+            let trimmed = text.trim();
+            for fact in self.fact_stack.iter_mut() {
+                fact.text.push_str(trimmed);
+            }
             return Ok(());
         }
 
