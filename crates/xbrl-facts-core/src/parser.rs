@@ -135,7 +135,7 @@ fn normalize_fact(
             decimals: fact.decimals.clone(),
         },
         RawFactValue::Text { value } => NormalizedValue::Text {
-            value: value.clone(),
+            value: apply_text_transform(value, fact.inline_meta.as_ref()),
             lang: fact.lang.clone(),
         },
         RawFactValue::Nil => NormalizedValue::Nil,
@@ -1109,6 +1109,117 @@ fn format_local_name(format: &str) -> Option<&str> {
         .map_or(Some(format), |(_, local)| Some(local))
 }
 
+/// Apply an iXBRL Transformations Registry text transform.
+///
+/// Implements a subset of the TR4 registry that EDINET filings use in
+/// practice. Numeric transforms (numdotdecimal, numcommadecimal, zerodash,
+/// numdash, fixed-zero) are handled inside [`normalize_numeric_text`]; this
+/// function covers the text/date/boolean transforms applied to
+/// `ix:nonNumeric` facts.
+fn apply_text_transform(raw: &str, inline_meta: Option<&InlineMeta>) -> String {
+    let Some(format) = inline_meta.and_then(|meta| meta.format.as_deref()) else {
+        return raw.to_owned();
+    };
+    let Some(local) = format_local_name(format) else {
+        return raw.to_owned();
+    };
+    match local.to_ascii_lowercase().as_str() {
+        "dateyearmonthdaycjk" => transform_date_ymd_cjk(raw).unwrap_or_else(|| raw.to_owned()),
+        "dateyearmonthcjk" => transform_date_ym_cjk(raw).unwrap_or_else(|| raw.to_owned()),
+        "datemonthdaycjk" => transform_date_md_cjk(raw).unwrap_or_else(|| raw.to_owned()),
+        "dateerayearmonthdayjp" => transform_date_era_ymd_jp(raw).unwrap_or_else(|| raw.to_owned()),
+        "booleanfalse" | "fixed-false" => "false".to_owned(),
+        "booleantrue" | "fixed-true" => "true".to_owned(),
+        "fixed-empty" | "nocontent" => String::new(),
+        _ => raw.to_owned(),
+    }
+}
+
+/// Map a CJK or fullwidth digit string to ASCII digits, returning `None`
+/// if a non-digit character (other than known CJK 0-9 numerals) is found.
+fn to_ascii_digits(input: &str) -> Option<String> {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        let digit = match ch {
+            '0'..='9' => ch,
+            '０'..='９' => char::from(b'0' + (ch as u32 - '０' as u32) as u8),
+            '〇' | '零' => '0',
+            '一' | '壱' => '1',
+            '二' | '弐' => '2',
+            '三' | '参' => '3',
+            '四' => '4',
+            '五' => '5',
+            '六' => '6',
+            '七' => '7',
+            '八' => '8',
+            '九' => '9',
+            _ => return None,
+        };
+        out.push(digit);
+    }
+    Some(out)
+}
+
+fn transform_date_ymd_cjk(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let (year, rest) = trimmed.split_once('年')?;
+    let (month, rest) = rest.split_once('月')?;
+    let day = rest.strip_suffix('日')?;
+    let year = to_ascii_digits(year.trim())?;
+    let month = to_ascii_digits(month.trim())?;
+    let day = to_ascii_digits(day.trim())?;
+    Some(format!("{:0>4}-{:0>2}-{:0>2}", year, month, day,))
+}
+
+fn transform_date_ym_cjk(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let (year, rest) = trimmed.split_once('年')?;
+    let month = rest.strip_suffix('月')?;
+    let year = to_ascii_digits(year.trim())?;
+    let month = to_ascii_digits(month.trim())?;
+    Some(format!("{:0>4}-{:0>2}", year, month))
+}
+
+fn transform_date_md_cjk(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let (month, rest) = trimmed.split_once('月')?;
+    let day = rest.strip_suffix('日')?;
+    let month = to_ascii_digits(month.trim())?;
+    let day = to_ascii_digits(day.trim())?;
+    Some(format!("--{:0>2}-{:0>2}", month, day))
+}
+
+/// Japanese era date: e.g. `令和7年6月26日` → `2025-06-26`.
+fn transform_date_era_ymd_jp(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let (era, rest) = era_prefix(trimmed)?;
+    let (year, rest) = rest.split_once('年')?;
+    let (month, rest) = rest.split_once('月')?;
+    let day = rest.strip_suffix('日')?;
+    let year_n: u32 = to_ascii_digits(year.trim())?.parse().ok()?;
+    let month: u32 = to_ascii_digits(month.trim())?.parse().ok()?;
+    let day: u32 = to_ascii_digits(day.trim())?.parse().ok()?;
+    let base = match era {
+        "令和" => 2018,
+        "平成" => 1988,
+        "昭和" => 1925,
+        "大正" => 1911,
+        "明治" => 1867,
+        _ => return None,
+    };
+    let year = base + year_n;
+    Some(format!("{year}-{:0>2}-{:0>2}", month, day))
+}
+
+fn era_prefix(s: &str) -> Option<(&str, &str)> {
+    for era in ["令和", "平成", "昭和", "大正", "明治"] {
+        if let Some(rest) = s.strip_prefix(era) {
+            return Some((era, rest));
+        }
+    }
+    None
+}
+
 fn apply_scale(mut value: Decimal, scale: i32) -> Decimal {
     let ten = Decimal::new(10, 0);
     if scale >= 0 {
@@ -1500,6 +1611,59 @@ mod tests {
                 decimal: Some(Decimal::new(-1234, 0)),
                 decimals: Some(Decimals::Value { n: 0 }),
             }
+        );
+    }
+
+    #[test]
+    fn transform_dates_to_iso() {
+        let meta = |fmt: &str| {
+            Some(InlineMeta {
+                format: Some(fmt.to_owned()),
+                scale: None,
+                sign: None,
+                target: None,
+                continued_from: None,
+                is_hidden: false,
+            })
+        };
+
+        assert_eq!(
+            apply_text_transform("2025年6月26日", meta("ixt:dateyearmonthdaycjk").as_ref()),
+            "2025-06-26"
+        );
+        assert_eq!(
+            apply_text_transform(
+                "２０２５年６月２６日",
+                meta("ixt:dateyearmonthdaycjk").as_ref()
+            ),
+            "2025-06-26"
+        );
+        assert_eq!(
+            apply_text_transform("2025年3月", meta("ixt:dateyearmonthcjk").as_ref()),
+            "2025-03"
+        );
+        assert_eq!(
+            apply_text_transform("令和7年6月26日", meta("ixt:dateerayearmonthdayjp").as_ref()),
+            "2025-06-26"
+        );
+        assert_eq!(
+            apply_text_transform("anything", meta("ixt:fixed-false").as_ref()),
+            "false"
+        );
+        assert_eq!(
+            apply_text_transform("anything", meta("ixt:nocontent").as_ref()),
+            ""
+        );
+
+        // Unknown format → passthrough
+        assert_eq!(
+            apply_text_transform("raw", meta("ixt:made-up").as_ref()),
+            "raw"
+        );
+        // Malformed input → passthrough
+        assert_eq!(
+            apply_text_transform("not a date", meta("ixt:dateyearmonthdaycjk").as_ref()),
+            "not a date"
         );
     }
 
