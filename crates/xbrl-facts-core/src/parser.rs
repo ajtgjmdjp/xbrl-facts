@@ -156,7 +156,7 @@ fn normalize_fact(
             element_id: None,
             fact_id: fact.id.clone(),
             context_ref: fact.context_ref.clone(),
-            byte_range: None,
+            byte_range: fact.byte_range,
         },
     })
 }
@@ -326,8 +326,14 @@ impl<'a> InstanceParser<'a> {
 
         // Inline facts (ix:nonFraction/ix:nonNumeric) can nest inside other
         // inline facts, so check this before bumping the parent's depth.
-        if let Some(fact) = FactBuilder::inline(&qname, &attrs, &namespaces, self.hidden_depth > 0)?
-        {
+        let byte_start = self.reader.buffer_position();
+        if let Some(fact) = FactBuilder::inline(
+            &qname,
+            &attrs,
+            &namespaces,
+            self.hidden_depth > 0,
+            byte_start,
+        )? {
             self.fact_stack.push(fact);
             self.text_target = Some(TextTarget::Fact);
             return Ok(true);
@@ -366,7 +372,7 @@ impl<'a> InstanceParser<'a> {
 
         if let Some(context_ref) = attrs.get("contextRef").cloned() {
             self.fact_stack
-                .push(FactBuilder::new(qname, context_ref, &attrs)?);
+                .push(FactBuilder::new(qname, context_ref, &attrs, byte_start)?);
             self.text_target = Some(TextTarget::Fact);
         }
 
@@ -389,7 +395,8 @@ impl<'a> InstanceParser<'a> {
             if top.depth > 0 {
                 top.depth -= 1;
             } else {
-                let finished = self.fact_stack.pop().expect("fact exists").finish();
+                let byte_end = self.reader.buffer_position();
+                let finished = self.fact_stack.pop().expect("fact exists").finish(byte_end);
                 self.doc.facts.push(finished);
                 if self.fact_stack.is_empty() {
                     self.text_target = None;
@@ -825,6 +832,7 @@ struct FactBuilder {
     depth: usize,
     kind: Option<FactKind>,
     inline_meta: Option<InlineMeta>,
+    byte_start: u64,
 }
 
 impl FactBuilder {
@@ -832,6 +840,7 @@ impl FactBuilder {
         name: QName,
         context_ref: String,
         attrs: &BTreeMap<String, String>,
+        byte_start: u64,
     ) -> Result<Self, XbrlError> {
         Ok(Self {
             id: attrs.get("id").cloned(),
@@ -854,6 +863,7 @@ impl FactBuilder {
             depth: 0,
             kind: None,
             inline_meta: None,
+            byte_start,
         })
     }
 
@@ -862,6 +872,7 @@ impl FactBuilder {
         attrs: &BTreeMap<String, String>,
         namespaces: &NamespaceMap,
         is_hidden: bool,
+        byte_start: u64,
     ) -> Result<Option<Self>, XbrlError> {
         let kind = match element_name.local_name.as_str() {
             "nonFraction" => FactKind::Numeric,
@@ -904,10 +915,11 @@ impl FactBuilder {
                 continued_from: attrs.get("continuedAt").cloned(),
                 is_hidden,
             }),
+            byte_start,
         }))
     }
 
-    fn finish(self) -> RawFact {
+    fn finish(self, byte_end: u64) -> RawFact {
         let value = if self.nil {
             RawFactValue::Nil
         } else if self.kind == Some(FactKind::Numeric)
@@ -930,6 +942,7 @@ impl FactBuilder {
             precision: self.precision,
             lang: self.lang,
             inline_meta: self.inline_meta,
+            byte_range: Some((self.byte_start, byte_end)),
         }
     }
 }
@@ -1463,6 +1476,7 @@ mod tests {
                 precision: None,
                 lang: None,
                 inline_meta: None,
+                byte_range: None,
             }],
             footnotes: vec![],
         };

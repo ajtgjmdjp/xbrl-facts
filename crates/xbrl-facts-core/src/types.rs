@@ -78,6 +78,10 @@ pub struct RawFact {
     pub precision: Option<Precision>,
     pub lang: Option<String>,
     pub inline_meta: Option<InlineMeta>,
+    /// Half-open byte range `[start, end)` of the source XML element that
+    /// declared the fact. `None` for facts assembled outside an XML stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_range: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -313,6 +317,7 @@ mod tests {
             precision: None,
             lang: None,
             inline_meta: None,
+            byte_range: Some((100, 200)),
         };
         let json = serde_json::to_string(&fact).unwrap();
         let back: RawFact = serde_json::from_str(&json).unwrap();
