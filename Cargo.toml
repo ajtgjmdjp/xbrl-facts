@@ -8,3 +8,7 @@ edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/ajtgjmdjp/xbrl-facts"
+homepage = "https://github.com/ajtgjmdjp/xbrl-facts"
+authors = ["ajtgjmdjp <195097911+ajtgjmdjp@users.noreply.github.com>"]
+keywords = ["xbrl", "ixbrl", "edgar", "edinet", "finance"]
+categories = ["parser-implementations", "finance"]

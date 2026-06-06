@@ -1,11 +1,16 @@
 [package]
 name = "xbrl-facts-cli"
-description = "CLI for xbrl-facts: parse, inspect, and export XBRL financial data"
+description = "Command-line interface for xbrl-facts: parse SEC/EDINET iXBRL filings and export normalized facts"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [[bin]]
 name = "xbrl-facts"

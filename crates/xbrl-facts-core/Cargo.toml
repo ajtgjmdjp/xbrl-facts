@@ -1,11 +1,16 @@
 [package]
 name = "xbrl-facts-core"
-description = "XBRL/iXBRL parser with provenance-rich normalized financial facts"
+description = "iXBRL/XBRL 2.1 parser with provenance-rich normalized facts for SEC EDGAR and EDINET filings"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
