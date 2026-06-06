@@ -199,6 +199,7 @@ struct InstanceParser<'a> {
     context: Option<ContextBuilder>,
     unit: Option<UnitBuilder>,
     fact_stack: Vec<FactBuilder>,
+    continuation_stack: Vec<ContinuationBuilder>,
     text_target: Option<TextTarget>,
     hidden_depth: usize,
     continuations: BTreeMap<String, Continuation>,
@@ -224,6 +225,7 @@ impl<'a> InstanceParser<'a> {
             context: None,
             unit: None,
             fact_stack: Vec::new(),
+            continuation_stack: Vec::new(),
             text_target: None,
             hidden_depth: 0,
             continuations: BTreeMap::new(),
@@ -286,8 +288,17 @@ impl<'a> InstanceParser<'a> {
         }
 
         if qname.local_name == "continuation" {
-            self.continuation(element, &attrs)?;
-            return Ok(false);
+            let frame = Frame {
+                qname: qname.clone(),
+                namespaces: namespaces.clone(),
+            };
+            self.stack.push(frame);
+            self.continuation_stack.push(ContinuationBuilder {
+                id: attrs.get("id").cloned(),
+                continued_at: attrs.get("continuedAt").cloned(),
+                text: String::new(),
+            });
+            return Ok(true);
         }
 
         match qname.local_name.as_str() {
@@ -391,6 +402,21 @@ impl<'a> InstanceParser<'a> {
             });
         };
 
+        if qname.local_name == "continuation"
+            && let Some(c) = self.continuation_stack.pop()
+        {
+            if let Some(id) = c.id {
+                self.continuations.insert(
+                    id,
+                    Continuation {
+                        text: c.text,
+                        continued_at: c.continued_at,
+                    },
+                );
+            }
+            return Ok(());
+        }
+
         if let Some(top) = self.fact_stack.last_mut() {
             if top.depth > 0 {
                 top.depth -= 1;
@@ -448,10 +474,13 @@ impl<'a> InstanceParser<'a> {
             return Ok(());
         }
 
-        if !self.fact_stack.is_empty() {
+        if !self.fact_stack.is_empty() || !self.continuation_stack.is_empty() {
             let trimmed = text.trim();
             for fact in self.fact_stack.iter_mut() {
                 fact.text.push_str(trimmed);
+            }
+            for c in self.continuation_stack.iter_mut() {
+                c.text.push_str(trimmed);
             }
             return Ok(());
         }
@@ -578,25 +607,6 @@ impl<'a> InstanceParser<'a> {
         context.push_element(
             container,
             ContextElement::TypedDimension { dimension, raw_xml },
-        );
-        Ok(())
-    }
-
-    fn continuation(
-        &mut self,
-        element: &BytesStart<'_>,
-        attrs: &BTreeMap<String, String>,
-    ) -> Result<(), XbrlError> {
-        let Some(id) = attrs.get("id") else {
-            return Ok(());
-        };
-        let text = self.reader.read_text(element.to_end().name())?.into_owned();
-        self.continuations.insert(
-            id.clone(),
-            Continuation {
-                text,
-                continued_at: attrs.get("continuedAt").cloned(),
-            },
         );
         Ok(())
     }
@@ -954,6 +964,13 @@ enum FactKind {
 }
 
 #[derive(Debug, Clone)]
+struct ContinuationBuilder {
+    id: Option<String>,
+    continued_at: Option<String>,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
 struct Continuation {
     text: String,
     continued_at: Option<String>,
@@ -1078,7 +1095,18 @@ fn parse_normalized_decimal(
 }
 
 fn normalize_numeric_text(raw: &str, inline_meta: Option<&InlineMeta>) -> String {
-    let mut text = raw.trim().replace([' ', '\u{a0}'], "");
+    let raw_trim = raw.trim();
+    let format = inline_meta.and_then(|meta| meta.format.as_deref());
+    let format_local = format.and_then(format_local_name);
+
+    // SEC's numwordsen transform: spelled-out English numbers ("one" → "1").
+    if format_local.is_some_and(|f| f.eq_ignore_ascii_case("numwordsen"))
+        && let Some(num) = english_words_to_number(raw_trim)
+    {
+        return num;
+    }
+
+    let mut text = raw_trim.replace([' ', '\u{a0}'], "");
     let is_parenthesized_negative = text.starts_with('(') && text.ends_with(')');
     if is_parenthesized_negative {
         text = text
@@ -1087,13 +1115,9 @@ fn normalize_numeric_text(raw: &str, inline_meta: Option<&InlineMeta>) -> String
             .to_owned();
     }
 
-    let format = inline_meta.and_then(|meta| meta.format.as_deref());
     let mut normalized = if is_zero_dash(&text, format) {
         "0".to_owned()
-    } else if format
-        .and_then(format_local_name)
-        .is_some_and(|local| local.eq_ignore_ascii_case("numcommadecimal"))
-    {
+    } else if format_local.is_some_and(|local| local.eq_ignore_ascii_case("numcommadecimal")) {
         text.replace('.', "").replace(',', ".")
     } else {
         text.replace(',', "")
@@ -1104,6 +1128,98 @@ fn normalize_numeric_text(raw: &str, inline_meta: Option<&InlineMeta>) -> String
     }
 
     normalized
+}
+
+/// Convert SEC `ixt-sec:numwordsen` spelled-out numbers ("one", "twenty-three",
+/// "one hundred million") into ASCII digit form. Returns `None` if the input
+/// contains a word outside the supported vocabulary so the caller can decide
+/// how to recover.
+fn english_words_to_number(input: &str) -> Option<String> {
+    let normalized = input.to_ascii_lowercase().replace('-', " ");
+    let tokens: Vec<&str> = normalized
+        .split_whitespace()
+        .filter(|t| *t != "and")
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let unit_value = |w: &str| -> Option<u64> {
+        Some(match w {
+            "zero" => 0,
+            "one" => 1,
+            "two" => 2,
+            "three" => 3,
+            "four" => 4,
+            "five" => 5,
+            "six" => 6,
+            "seven" => 7,
+            "eight" => 8,
+            "nine" => 9,
+            "ten" => 10,
+            "eleven" => 11,
+            "twelve" => 12,
+            "thirteen" => 13,
+            "fourteen" => 14,
+            "fifteen" => 15,
+            "sixteen" => 16,
+            "seventeen" => 17,
+            "eighteen" => 18,
+            "nineteen" => 19,
+            "twenty" => 20,
+            "thirty" => 30,
+            "forty" => 40,
+            "fifty" => 50,
+            "sixty" => 60,
+            "seventy" => 70,
+            "eighty" => 80,
+            "ninety" => 90,
+            _ => return None,
+        })
+    };
+
+    let mut total: u64 = 0;
+    let mut current: u64 = 0;
+    for tok in &tokens {
+        match *tok {
+            "hundred" => {
+                if current == 0 {
+                    current = 1;
+                }
+                current *= 100;
+            }
+            "thousand" => {
+                if current == 0 {
+                    current = 1;
+                }
+                total += current * 1_000;
+                current = 0;
+            }
+            "million" => {
+                if current == 0 {
+                    current = 1;
+                }
+                total += current * 1_000_000;
+                current = 0;
+            }
+            "billion" => {
+                if current == 0 {
+                    current = 1;
+                }
+                total += current * 1_000_000_000;
+                current = 0;
+            }
+            "trillion" => {
+                if current == 0 {
+                    current = 1;
+                }
+                total += current * 1_000_000_000_000;
+                current = 0;
+            }
+            other => current += unit_value(other)?,
+        }
+    }
+    Some((total + current).to_string())
 }
 
 fn is_zero_dash(text: &str, format: Option<&str>) -> bool {
