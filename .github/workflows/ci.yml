@@ -12,7 +12,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85"
           components: rustfmt, clippy
       - name: Format
         run: cargo fmt --all --check
@@ -21,4 +20,16 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
       - name: Package
+        # requires a cargo new enough to package workspaces with unpublished
+        # path dependencies, hence the stable toolchain job
         run: cargo package --workspace --locked
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+      - name: Check on MSRV
+        run: cargo check --workspace --all-targets --locked

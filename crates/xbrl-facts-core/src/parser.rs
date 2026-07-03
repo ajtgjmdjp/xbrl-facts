@@ -1308,7 +1308,7 @@ fn transform_date_ymd_cjk(raw: &str) -> Option<String> {
     let year = to_ascii_digits(year.trim())?;
     let month = to_ascii_digits(month.trim())?;
     let day = to_ascii_digits(day.trim())?;
-    Some(format!("{:0>4}-{:0>2}-{:0>2}", year, month, day,))
+    Some(format!("{year:0>4}-{month:0>2}-{day:0>2}"))
 }
 
 fn transform_date_ym_cjk(raw: &str) -> Option<String> {
@@ -1317,7 +1317,7 @@ fn transform_date_ym_cjk(raw: &str) -> Option<String> {
     let month = rest.strip_suffix('月')?;
     let year = to_ascii_digits(year.trim())?;
     let month = to_ascii_digits(month.trim())?;
-    Some(format!("{:0>4}-{:0>2}", year, month))
+    Some(format!("{year:0>4}-{month:0>2}"))
 }
 
 fn transform_date_md_cjk(raw: &str) -> Option<String> {
@@ -1326,7 +1326,7 @@ fn transform_date_md_cjk(raw: &str) -> Option<String> {
     let day = rest.strip_suffix('日')?;
     let month = to_ascii_digits(month.trim())?;
     let day = to_ascii_digits(day.trim())?;
-    Some(format!("--{:0>2}-{:0>2}", month, day))
+    Some(format!("--{month:0>2}-{day:0>2}"))
 }
 
 /// Japanese era date: e.g. `令和7年6月26日` → `2025-06-26`.
@@ -1348,7 +1348,7 @@ fn transform_date_era_ymd_jp(raw: &str) -> Option<String> {
         _ => return None,
     };
     let year = base + year_n;
-    Some(format!("{year}-{:0>2}-{:0>2}", month, day))
+    Some(format!("{year}-{month:0>2}-{day:0>2}"))
 }
 
 fn era_prefix(s: &str) -> Option<(&str, &str)> {
