@@ -210,7 +210,13 @@ impl LabelLinkbase {
                     text_buf.push_str(text.unescape()?.as_ref());
                 }
                 Event::CData(text) if current_label.is_some() => {
-                    text_buf.push_str(str::from_utf8(&text).unwrap_or_default());
+                    // Unreachable today (the whole input is UTF-8-validated
+                    // above), but never silently drop CDATA content.
+                    let text = str::from_utf8(&text).map_err(|e| XbrlError::Xml {
+                        message: format!("invalid UTF-8 in CDATA: {e}"),
+                        byte_offset: Some(reader.buffer_position()),
+                    })?;
+                    text_buf.push_str(text);
                 }
                 Event::End(end) => {
                     if local_name(end.name().as_ref()) == b"label"
@@ -327,6 +333,27 @@ mod tests {
         assert_eq!(
             lab.label(&qname, Some(role::LABEL), Some("en")).as_deref(),
             Some("Net Sales")
+        );
+    }
+
+    #[test]
+    fn preserves_cdata_label_content() {
+        let lab_with_cdata = LAB.replace("Net Sales", "<![CDATA[Net <Sales> & more]]>");
+        let mut schema = SchemaIndex::new();
+        schema
+            .ingest_schema("example.xsd", SCHEMA.as_bytes())
+            .unwrap();
+        let mut lab = LabelLinkbase::new();
+        lab.ingest(lab_with_cdata.as_bytes(), &schema).unwrap();
+
+        let qname = QName {
+            namespace_uri: Some("http://example.com/taxonomy".into()),
+            prefix: Some("ex".into()),
+            local_name: "NetSales".into(),
+        };
+        assert_eq!(
+            lab.label(&qname, Some(role::LABEL), Some("en")).as_deref(),
+            Some("Net <Sales> & more")
         );
     }
 

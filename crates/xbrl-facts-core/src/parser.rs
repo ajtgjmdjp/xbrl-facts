@@ -255,7 +255,15 @@ impl<'a> InstanceParser<'a> {
                     }
                 }
                 Event::Text(text) => self.text(text.unescape()?.as_ref())?,
-                Event::CData(text) => self.text(str::from_utf8(&text).unwrap_or_default())?,
+                Event::CData(text) => {
+                    // Unreachable today (the whole input is UTF-8-validated in
+                    // parse_instance), but never silently drop CDATA content.
+                    let text = str::from_utf8(&text).map_err(|e| XbrlError::Xml {
+                        message: format!("invalid UTF-8 in CDATA: {e}"),
+                        byte_offset: Some(self.reader.buffer_position()),
+                    })?;
+                    self.text(text)?;
+                }
                 Event::End(end) => self.end_element(end.name().as_ref())?,
                 Event::Eof => break,
                 _ => {}
@@ -1193,48 +1201,36 @@ fn english_words_to_number(input: &str) -> Option<String> {
         })
     };
 
+    // All arithmetic is checked: crafted input ("one trillion" repeated,
+    // stacked "hundred"s, ...) must yield None instead of a debug-build
+    // panic or a silently wrapped value.
     let mut total: u64 = 0;
     let mut current: u64 = 0;
     for tok in &tokens {
-        match *tok {
+        let multiplier = match *tok {
             "hundred" => {
                 if current == 0 {
                     current = 1;
                 }
-                current *= 100;
+                current = current.checked_mul(100)?;
+                continue;
             }
-            "thousand" => {
-                if current == 0 {
-                    current = 1;
-                }
-                total += current * 1_000;
-                current = 0;
+            "thousand" => 1_000,
+            "million" => 1_000_000,
+            "billion" => 1_000_000_000,
+            "trillion" => 1_000_000_000_000,
+            other => {
+                current = current.checked_add(unit_value(other)?)?;
+                continue;
             }
-            "million" => {
-                if current == 0 {
-                    current = 1;
-                }
-                total += current * 1_000_000;
-                current = 0;
-            }
-            "billion" => {
-                if current == 0 {
-                    current = 1;
-                }
-                total += current * 1_000_000_000;
-                current = 0;
-            }
-            "trillion" => {
-                if current == 0 {
-                    current = 1;
-                }
-                total += current * 1_000_000_000_000;
-                current = 0;
-            }
-            other => current += unit_value(other)?,
+        };
+        if current == 0 {
+            current = 1;
         }
+        total = total.checked_add(current.checked_mul(multiplier)?)?;
+        current = 0;
     }
-    Some((total + current).to_string())
+    total.checked_add(current).map(|n| n.to_string())
 }
 
 fn is_zero_dash(text: &str, format: Option<&str>) -> bool {
@@ -1952,6 +1948,34 @@ mod tests {
         assert_eq!(
             apply_text_transform("not a date", meta("ixt:dateyearmonthdaycjk").as_ref()),
             "not a date"
+        );
+    }
+
+    #[test]
+    fn numwordsen_overflow_returns_none() {
+        // u64 multiply overflow: 9 * 100^10 > u64::MAX. Unchecked arithmetic
+        // panicked in debug builds / wrapped in release.
+        let mul_overflow = format!("nine{}", " hundred".repeat(10));
+        assert_eq!(english_words_to_number(&mul_overflow), None);
+
+        // Multiplier-word overflow: 9e10 * 10^12 > u64::MAX.
+        assert_eq!(
+            english_words_to_number(&format!("nine{} trillion", " hundred".repeat(5))),
+            None
+        );
+
+        // u64 addition overflow in the running total.
+        let add_overflow = "nine hundred ninety nine trillion ".repeat(20_000);
+        assert_eq!(english_words_to_number(&add_overflow), None);
+
+        // Sanity: well-formed inputs still convert.
+        assert_eq!(
+            english_words_to_number("twenty-three").as_deref(),
+            Some("23")
+        );
+        assert_eq!(
+            english_words_to_number("one hundred million").as_deref(),
+            Some("100000000")
         );
     }
 
