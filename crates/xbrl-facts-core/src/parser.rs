@@ -919,7 +919,10 @@ impl FactBuilder {
             kind: Some(kind),
             inline_meta: Some(InlineMeta {
                 format: attrs.get("format").cloned(),
-                scale: attrs.get("scale").and_then(|scale| scale.parse().ok()),
+                scale: attrs
+                    .get("scale")
+                    .map(|scale| parse_ix_scale(scale))
+                    .transpose()?,
                 sign: attrs.get("sign").cloned(),
                 target: attrs.get("target").cloned(),
                 continued_from: attrs.get("continuedAt").cloned(),
@@ -1088,7 +1091,9 @@ fn parse_normalized_decimal(
         })?;
 
     if let Some(scale) = inline_meta.and_then(|meta| meta.scale) {
-        decimal = apply_scale(decimal, scale);
+        decimal = apply_scale(decimal, scale).ok_or_else(|| XbrlError::InvalidDecimal {
+            raw: raw.to_owned(),
+        })?;
     }
 
     Ok(decimal)
@@ -1349,18 +1354,54 @@ fn era_prefix(s: &str) -> Option<(&str, &str)> {
     None
 }
 
-fn apply_scale(mut value: Decimal, scale: i32) -> Decimal {
+/// Maximum magnitude accepted for the iXBRL `scale` attribute.
+///
+/// `rust_decimal::Decimal` holds at most 28-29 significant digits, so any
+/// scale outside ±28 either overflows or underflows to zero; real filings
+/// use single-digit scales. Bounding the range also keeps [`apply_scale`]
+/// constant-bounded with respect to untrusted input (a huge `scale` used to
+/// spin the multiply loop for up to `i32::MAX` iterations).
+const MAX_SCALE_MAGNITUDE: i32 = 28;
+
+/// Parse and validate an `ix:nonFraction` `scale` attribute.
+///
+/// Unparseable or out-of-range values are hard errors: silently dropping the
+/// scale would produce values off by powers of ten.
+fn parse_ix_scale(value: &str) -> Result<i32, XbrlError> {
+    let scale: i32 = value.parse().map_err(|_| XbrlError::Xml {
+        message: format!("invalid scale value: {value}"),
+        byte_offset: None,
+    })?;
+    if !(-MAX_SCALE_MAGNITUDE..=MAX_SCALE_MAGNITUDE).contains(&scale) {
+        return Err(XbrlError::Xml {
+            message: format!(
+                "scale value {scale} out of supported range \
+                 [-{MAX_SCALE_MAGNITUDE}, {MAX_SCALE_MAGNITUDE}]"
+            ),
+            byte_offset: None,
+        });
+    }
+    Ok(scale)
+}
+
+/// Multiply `value` by 10^`scale`, returning `None` on overflow or when
+/// `scale` is outside `±`[`MAX_SCALE_MAGNITUDE`] (defense in depth for
+/// [`InlineMeta`] values constructed outside [`parse_ix_scale`]).
+fn apply_scale(mut value: Decimal, scale: i32) -> Option<Decimal> {
+    if !(-MAX_SCALE_MAGNITUDE..=MAX_SCALE_MAGNITUDE).contains(&scale) {
+        return None;
+    }
     let ten = Decimal::new(10, 0);
     if scale >= 0 {
         for _ in 0..scale {
-            value *= ten;
+            value = value.checked_mul(ten)?;
         }
     } else {
         for _ in scale..0 {
-            value /= ten;
+            value = value.checked_div(ten)?;
         }
     }
-    value
+    Some(value)
 }
 
 #[derive(Debug, Clone)]
@@ -1742,6 +1783,113 @@ mod tests {
                 decimals: Some(Decimals::Value { n: 0 }),
             }
         );
+    }
+
+    fn inline_doc_with_scale(scale: &str) -> String {
+        format!(
+            r#"
+<html
+    xmlns="http://www.w3.org/1999/xhtml"
+    xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"
+    xmlns:xbrli="http://www.xbrl.org/2003/instance"
+    xmlns:iso4217="http://www.xbrl.org/2003/iso4217"
+    xmlns:ex="http://example.com/taxonomy">
+  <body>
+    <xbrli:context id="c1">
+      <xbrli:entity>
+        <xbrli:identifier scheme="http://example.com/entity">E00001</xbrli:identifier>
+      </xbrli:entity>
+      <xbrli:period>
+        <xbrli:instant>2025-03-31</xbrli:instant>
+      </xbrli:period>
+    </xbrli:context>
+    <xbrli:unit id="JPY">
+      <xbrli:measure>iso4217:JPY</xbrli:measure>
+    </xbrli:unit>
+    <p><ix:nonFraction name="ex:Revenue" contextRef="c1" unitRef="JPY" decimals="0" scale="{scale}">1</ix:nonFraction></p>
+  </body>
+</html>
+"#
+        )
+    }
+
+    #[test]
+    fn rejects_unparseable_scale_attribute() {
+        let doc = inline_doc_with_scale("abc");
+        let err = parse_instance(doc.as_bytes()).unwrap_err();
+        assert!(
+            matches!(&err, XbrlError::Xml { message, .. } if message.contains("scale")),
+            "expected scale parse error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_scale_attribute() {
+        // Huge positive, huge negative, and just-out-of-range values must all
+        // fail fast instead of hanging in apply_scale or being dropped.
+        for scale in ["2147483647", "-2147483648", "29", "-29", "9999999999"] {
+            let doc = inline_doc_with_scale(scale);
+            let err = parse_instance(doc.as_bytes()).unwrap_err();
+            assert!(
+                matches!(&err, XbrlError::Xml { message, .. } if message.contains("scale")),
+                "scale={scale}: expected scale error, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_boundary_scale_values() {
+        for (scale, expected) in [
+            ("28", "10000000000000000000000000000"),
+            ("-28", "0.0000000000000000000000000001"),
+        ] {
+            let doc = inline_doc_with_scale(scale);
+            let instance = parse_instance(doc.as_bytes()).unwrap();
+            let normalized = normalize_facts(&instance, &Labels, "scale-doc");
+            let fact = normalized[0].as_ref().unwrap();
+            match &fact.value {
+                NormalizedValue::Numeric { decimal, .. } => {
+                    assert_eq!(decimal.as_ref().unwrap().to_string(), expected);
+                }
+                other => panic!("expected numeric, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn apply_scale_rejects_extreme_scale_without_looping() {
+        // Must return promptly (constant-bounded work), not iterate i32::MAX times.
+        assert_eq!(apply_scale(Decimal::ONE, i32::MAX), None);
+        assert_eq!(apply_scale(Decimal::ONE, i32::MIN), None);
+    }
+
+    #[test]
+    fn apply_scale_returns_none_on_overflow() {
+        // 8 * 10^28 exceeds Decimal::MAX (~7.9e28).
+        assert_eq!(apply_scale(Decimal::new(8, 0), 28), None);
+        assert_eq!(
+            apply_scale(Decimal::ONE, 28).unwrap().to_string(),
+            "10000000000000000000000000000"
+        );
+        assert_eq!(
+            apply_scale(Decimal::ONE, -28).unwrap().to_string(),
+            "0.0000000000000000000000000001"
+        );
+    }
+
+    #[test]
+    fn normalize_rejects_out_of_range_scale_in_meta() {
+        // InlineMeta is a public type, so scale can bypass attribute parsing.
+        let meta = InlineMeta {
+            format: None,
+            scale: Some(i32::MAX),
+            sign: None,
+            target: None,
+            continued_from: None,
+            is_hidden: false,
+        };
+        let err = parse_normalized_decimal("1", Some(&meta)).unwrap_err();
+        assert!(matches!(err, XbrlError::InvalidDecimal { .. }));
     }
 
     #[test]
