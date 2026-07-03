@@ -238,11 +238,18 @@ impl<'a> InstanceParser<'a> {
     fn parse(&mut self) -> Result<InstanceDocument, XbrlError> {
         loop {
             match self.reader.read_event()? {
+                // quick-xml 0.37's `buffer_position()` points just past the
+                // `>` once `read_event()` has consumed the tag, so recover
+                // the position of the opening `<` from the raw tag length:
+                // `BytesStart` wraps the content between `<` and `>` (with
+                // the trailing `/` stripped for self-closing tags).
                 Event::Start(element) => {
-                    self.start_element(&element)?;
+                    let byte_start = self.reader.buffer_position() - element.len() as u64 - 2;
+                    self.start_element(&element, byte_start)?;
                 }
                 Event::Empty(element) => {
-                    let pushed = self.start_element(&element)?;
+                    let byte_start = self.reader.buffer_position() - element.len() as u64 - 3;
+                    let pushed = self.start_element(&element, byte_start)?;
                     if pushed {
                         self.end_element(element.name().as_ref())?;
                     }
@@ -273,7 +280,11 @@ impl<'a> InstanceParser<'a> {
         ))
     }
 
-    fn start_element(&mut self, element: &BytesStart<'_>) -> Result<bool, XbrlError> {
+    fn start_element(
+        &mut self,
+        element: &BytesStart<'_>,
+        byte_start: u64,
+    ) -> Result<bool, XbrlError> {
         let parent_namespaces = self
             .stack
             .last()
@@ -337,7 +348,6 @@ impl<'a> InstanceParser<'a> {
 
         // Inline facts (ix:nonFraction/ix:nonNumeric) can nest inside other
         // inline facts, so check this before bumping the parent's depth.
-        let byte_start = self.reader.buffer_position();
         if let Some(fact) = FactBuilder::inline(
             &qname,
             &attrs,
@@ -1942,6 +1952,49 @@ mod tests {
         assert_eq!(
             apply_text_transform("not a date", meta("ixt:dateyearmonthdaycjk").as_ref()),
             "not a date"
+        );
+    }
+
+    /// Slice `source` with the fact's recorded byte range.
+    fn slice_range(source: &str, fact: &RawFact) -> String {
+        let (start, end) = fact.byte_range.expect("byte range recorded");
+        String::from_utf8(source.as_bytes()[start as usize..end as usize].to_vec()).unwrap()
+    }
+
+    #[test]
+    fn byte_range_covers_plain_xbrl_source_element() {
+        let instance = parse_instance(MINIMAL_XBRL.as_bytes()).unwrap();
+        let fact = &instance.facts[0];
+        let sliced = slice_range(MINIMAL_XBRL, fact);
+        assert!(
+            sliced.starts_with('<'),
+            "byte range must start at '<', got {sliced:?}"
+        );
+        assert_eq!(
+            sliced,
+            r#"<ex:NetSales id="f1" contextRef="ctx1" unitRef="JPY" decimals="0">1000000</ex:NetSales>"#
+        );
+    }
+
+    #[test]
+    fn byte_range_covers_inline_fact_source_element() {
+        let instance = parse_instance(INLINE_XBRL.as_bytes()).unwrap();
+        let revenue = &instance.facts[1];
+        assert_eq!(revenue.name.local_name, "Revenue");
+        assert_eq!(
+            slice_range(INLINE_XBRL, revenue),
+            r#"<ix:nonFraction name="ex:Revenue" contextRef="c1" unitRef="JPY" decimals="-3" scale="3">1,234</ix:nonFraction>"#
+        );
+    }
+
+    #[test]
+    fn byte_range_covers_self_closing_fact_element() {
+        let instance = parse_instance(ADVANCED_XBRL.as_bytes()).unwrap();
+        let nil_fact = &instance.facts[1];
+        assert_eq!(nil_fact.value, RawFactValue::Nil);
+        assert_eq!(
+            slice_range(ADVANCED_XBRL, nil_fact),
+            r#"<ex:OptionalDisclosure contextRef="ctx_typed" xsi:nil="true"/>"#
         );
     }
 
