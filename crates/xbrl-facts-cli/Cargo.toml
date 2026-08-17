@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 xbrl-facts-core = { path = "../xbrl-facts-core", version = "0.1.0" }
+xbrl-facts-evidence = { path = "../xbrl-facts-evidence", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

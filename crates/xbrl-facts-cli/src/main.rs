@@ -57,6 +57,32 @@ enum Commands {
         #[arg(long = "lang", default_value = "ja")]
         lang: String,
     },
+    /// Emit evidence receipts (one JSON line per numeric fact)
+    Receipt {
+        /// Path to an XBRL instance file
+        path: PathBuf,
+
+        /// Document id recorded in each receipt (e.g. EDINET docID)
+        #[arg(long)]
+        doc_id: String,
+
+        /// Source URI recorded in the receipt
+        #[arg(long, default_value = "")]
+        uri: String,
+
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Deterministically verify evidence receipts against source bytes
+    Verify {
+        /// Path to a receipt JSON/JSONL file
+        receipts: PathBuf,
+
+        /// Path to the source XBRL instance the receipts cite
+        #[arg(long)]
+        source: PathBuf,
+    },
     /// Inspect parsed JSONL facts
     Inspect {
         /// Path to JSONL file
@@ -161,6 +187,62 @@ fn main() -> anyhow::Result<()> {
                     .with_context(|| format!("failed to write output file {}", output.display()))?;
             } else {
                 println!("{rendered}");
+            }
+        }
+        Commands::Receipt {
+            path,
+            doc_id,
+            uri,
+            output,
+        } => {
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("failed to read input file {}", path.display()))?;
+            let instance = parse_instance(&bytes)?;
+            let artifact = xbrl_facts_evidence::SourceArtifact {
+                uri: if uri.is_empty() {
+                    path.display().to_string()
+                } else {
+                    uri
+                },
+                sha256: xbrl_facts_evidence::sha256_hex(&bytes),
+                retrieved_at: None,
+                authority: None,
+            };
+            let receipts = xbrl_facts_evidence::build_receipts(&instance, &doc_id, &artifact)?;
+            let mut out = String::new();
+            for r in &receipts {
+                out.push_str(&serde_json::to_string(r)?);
+                out.push('\n');
+            }
+            match output {
+                Some(p) => std::fs::write(&p, out)
+                    .with_context(|| format!("failed to write {}", p.display()))?,
+                None => print!("{out}"),
+            }
+            eprintln!("{} receipts emitted", receipts.len());
+        }
+        Commands::Verify { receipts, source } => {
+            let source_bytes = std::fs::read(&source)
+                .with_context(|| format!("failed to read source {}", source.display()))?;
+            let text = std::fs::read_to_string(&receipts)
+                .with_context(|| format!("failed to read receipts {}", receipts.display()))?;
+            let ctx = xbrl_facts_evidence::SourceContext::load(&source_bytes)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let mut pass = 0usize;
+            let mut fail = 0usize;
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                let receipt: xbrl_facts_evidence::Receipt = serde_json::from_str(line)?;
+                let report = xbrl_facts_evidence::verify_in(&ctx, &receipt);
+                if report.status == xbrl_facts_evidence::ValidationStatus::Verified {
+                    pass += 1;
+                } else {
+                    fail += 1;
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+            }
+            eprintln!("verified: {pass} PASS, {fail} FAIL");
+            if fail > 0 {
+                std::process::exit(1);
             }
         }
         Commands::Inspect { path, concept } => {

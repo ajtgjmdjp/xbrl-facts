@@ -1,0 +1,21 @@
+[package]
+name = "xbrl-facts-evidence"
+description = "Evidence receipts: deterministic, verifiable claim-to-source records for XBRL facts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords = ["xbrl", "provenance", "audit", "evidence", "verification"]
+categories = ["parser-implementations", "finance"]
+
+[dependencies]
+xbrl-facts-core = { path = "../xbrl-facts-core", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+rust_decimal = { version = "1", features = ["serde-str"] }
+thiserror = "2"
