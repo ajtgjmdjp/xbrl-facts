@@ -15,7 +15,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use xbrl_facts_core::types::{InstanceDocument, NormalizedValue, RawFact};
+use xbrl_facts_core::types::{InstanceDocument, NormalizedValue};
 use xbrl_facts_core::{TaxonomyResolver, normalize_facts, parse_instance};
 
 const ENGINE: &str = concat!("xbrl-facts-evidence@", env!("CARGO_PKG_VERSION"));
@@ -66,11 +66,33 @@ pub struct Extraction {
     pub engine: String,
 }
 
+/// Profile-tagged locator. New regulated-document profiles are added as
+/// variants — the receipt schema itself never assumes XBRL.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "profile", rename_all = "snake_case")]
+pub enum Locator {
+    Xbrl(XbrlLocator),
+}
+
+impl Locator {
+    pub fn xbrl(&self) -> &XbrlLocator {
+        match self {
+            Locator::Xbrl(l) => l,
+        }
+    }
+
+    pub fn xbrl_mut(&mut self) -> &mut XbrlLocator {
+        match self {
+            Locator::Xbrl(l) => l,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Evidence {
     pub source_artifact: SourceArtifact,
-    pub locator: XbrlLocator,
+    pub locator: Locator,
     pub extraction: Extraction,
 }
 
@@ -96,9 +118,20 @@ pub struct Claim {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Receipt {
+    /// Receipt schema version (canonical encoding is pinned per version).
+    pub schema: String,
     pub receipt_id: String,
     pub claim: Claim,
     pub evidence: Vec<Evidence>,
+}
+
+pub const SCHEMA_VERSION: &str = "er/0.1";
+
+/// Content-derived id over the canonical body. Full digest — the id is an
+/// audit reference and (in M2) a signing subject, so no truncation.
+fn receipt_id_for(claim: &Claim, evidence: &[Evidence]) -> Result<String, EvidenceError> {
+    let body = serde_json::to_string(&(SCHEMA_VERSION, claim, evidence))?;
+    Ok(format!("er_{}", sha256_hex(body.as_bytes())))
 }
 
 // --- Verification ---
@@ -106,6 +139,10 @@ pub struct Receipt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckName {
+    /// The receipt id matches the canonical hash of its own body.
+    ReceiptId,
+    /// Exactly one evidence item (M1 shape).
+    EvidenceShape,
     /// Source bytes hash to the recorded artifact sha256.
     ArtifactHash,
     /// The locator resolves to exactly one fact in the re-parsed source.
@@ -190,6 +227,11 @@ pub fn build_receipts(
         let Some((value, _)) = canonical_value(&norm.value) else {
             continue;
         };
+        // Audit-grade XBRL profile requires an exact byte range; facts
+        // assembled outside an XML stream get no receipt.
+        if raw.byte_range.is_none() {
+            continue;
+        }
 
         let claim = Claim {
             value,
@@ -199,22 +241,20 @@ pub fn build_receipts(
         };
         let evidence = vec![Evidence {
             source_artifact: artifact.clone(),
-            locator: XbrlLocator {
+            locator: Locator::Xbrl(XbrlLocator {
                 concept: raw.name.to_string(),
                 context_ref: raw.context_ref.clone(),
                 unit_ref: raw.unit_ref.clone(),
                 byte_range: raw.byte_range,
-            },
+            }),
             extraction: Extraction {
                 engine: ENGINE.to_string(),
             },
         }];
 
-        // Deterministic id: content hash of the claim+evidence body.
-        let body = serde_json::to_string(&(&claim, &evidence))?;
-        let receipt_id = format!("er_{}", &sha256_hex(body.as_bytes())[..16]);
-
+        let receipt_id = receipt_id_for(&claim, &evidence)?;
         receipts.push(Receipt {
+            schema: SCHEMA_VERSION.to_string(),
             receipt_id,
             claim,
             evidence,
@@ -233,6 +273,9 @@ pub struct SourceContext {
     instance: InstanceDocument,
     /// (concept, context_ref, unit_ref) -> fact indices
     index: std::collections::HashMap<(String, String, Option<String>), Vec<usize>>,
+    /// Fact-index-aligned canonical values, normalized once at load.
+    /// (Value derivation does not depend on doc_id.)
+    values: Vec<Option<(String, Option<Decimal>)>>,
 }
 
 impl SourceContext {
@@ -250,10 +293,15 @@ impl SourceContext {
                 .or_default()
                 .push(i);
         }
+        let values = normalize_facts(&instance, &NoLabels, "")
+            .into_iter()
+            .map(|n| n.ok().and_then(|norm| canonical_value(&norm.value)))
+            .collect();
         Ok(Self {
             sha256: sha256_hex(source_bytes),
             instance,
             index,
+            values,
         })
     }
 
@@ -283,76 +331,91 @@ impl SourceContext {
     }
 }
 
-#[allow(dead_code)]
-fn locate<'a>(instance: &'a InstanceDocument, locator: &XbrlLocator) -> Vec<&'a RawFact> {
-    instance
-        .facts
-        .iter()
-        .filter(|f| {
-            f.name.to_string() == locator.concept
-                && f.context_ref == locator.context_ref
-                && f.unit_ref == locator.unit_ref
-        })
-        .collect()
-}
-
 /// Verify one receipt against a prepared [`SourceContext`].
 ///
 /// Every check runs even after an earlier failure, so the report shows
 /// the full failure surface (e.g. hash fail + value fail on tampering).
 pub fn verify_in(ctx: &SourceContext, receipt: &Receipt) -> VerificationReport {
     let mut checks = Vec::new();
-    let evidence = &receipt.evidence[0];
 
-    // 1. artifact hash
-    let hash_ok = ctx.sha256 == evidence.source_artifact.sha256;
+    // 0. receipt integrity: the id must be the canonical hash of the body.
+    // Without this, a tampered receipt could point at a different (valid)
+    // fact and still report Verified.
+    let id_ok = matches!(
+        receipt_id_for(&receipt.claim, &receipt.evidence),
+        Ok(expected) if expected == receipt.receipt_id && receipt.schema == SCHEMA_VERSION
+    );
     checks.push(Check {
-        name: CheckName::ArtifactHash,
-        pass: hash_ok,
-        detail: (!hash_ok).then(|| {
+        name: CheckName::ReceiptId,
+        pass: id_ok,
+        detail: (!id_ok).then(|| "receipt body does not hash to receipt_id".into()),
+    });
+
+    // 0b. M1 shape: exactly one evidence item — trailing items must not be
+    // silently ignored, and an empty list must fail loudly, not panic.
+    let shape_ok = receipt.evidence.len() == 1;
+    checks.push(Check {
+        name: CheckName::EvidenceShape,
+        pass: shape_ok,
+        detail: (!shape_ok).then(|| {
             format!(
-                "expected {}, got {}",
-                evidence.source_artifact.sha256, ctx.sha256
+                "{} evidence items, expected exactly 1",
+                receipt.evidence.len()
             )
         }),
     });
 
-    // 2. locate
-    let found = ctx.locate(&evidence.locator);
-    let locate_ok = found.len() == 1;
-    checks.push(Check {
-        name: CheckName::Locate,
-        pass: locate_ok,
-        detail: (!locate_ok).then(|| format!("matched {} facts, expected exactly 1", found.len())),
-    });
+    if let Some(evidence) = receipt.evidence.first() {
+        let locator = evidence.locator.xbrl();
 
-    if let Some(&idx) = found.first() {
-        let fact = &ctx.instance.facts[idx];
-
-        // 3. byte range
-        let range_ok = fact.byte_range == evidence.locator.byte_range;
+        // 1. artifact hash
+        let hash_ok = ctx.sha256 == evidence.source_artifact.sha256;
         checks.push(Check {
-            name: CheckName::ByteRange,
-            pass: range_ok,
-            detail: (!range_ok).then(|| {
+            name: CheckName::ArtifactHash,
+            pass: hash_ok,
+            detail: (!hash_ok).then(|| {
                 format!(
-                    "recorded {:?}, re-parsed {:?}",
-                    evidence.locator.byte_range, fact.byte_range
+                    "expected {}, got {}",
+                    evidence.source_artifact.sha256, ctx.sha256
                 )
             }),
         });
 
-        // 4. value match — re-derive the normalized value from source
-        let normalized = normalize_facts(&ctx.instance, &NoLabels, &receipt.claim.doc_id)
-            .into_iter()
-            .nth(idx);
-        let value_check = match normalized {
-            Some(Ok(norm)) => match canonical_value(&norm.value) {
+        // 2. locate
+        let found = ctx.locate(locator);
+        let locate_ok = found.len() == 1;
+        checks.push(Check {
+            name: CheckName::Locate,
+            pass: locate_ok,
+            detail: (!locate_ok)
+                .then(|| format!("matched {} facts, expected exactly 1", found.len())),
+        });
+
+        if let Some(&idx) = found.first() {
+            let fact = &ctx.instance.facts[idx];
+
+            // 3. byte range — required in the audit-grade XBRL profile
+            let range_ok = locator.byte_range.is_some() && fact.byte_range == locator.byte_range;
+            checks.push(Check {
+                name: CheckName::ByteRange,
+                pass: range_ok,
+                detail: (!range_ok).then(|| {
+                    format!(
+                        "recorded {:?}, re-parsed {:?}",
+                        locator.byte_range, fact.byte_range
+                    )
+                }),
+            });
+
+            // 4. value match — semantic decimal equality against the value
+            // re-derived from source. Byte-exactness of the claim itself is
+            // pinned by the ReceiptId check, so "1.0" vs "1" is not a hole.
+            let value_check = match &ctx.values[idx] {
                 Some((canon, dec)) => {
                     let claim_dec = receipt.claim.value.parse::<Decimal>().ok();
                     let pass = match (dec, claim_dec) {
-                        (Some(a), Some(b)) => a == b,
-                        _ => canon == receipt.claim.value,
+                        (Some(a), Some(b)) => *a == b,
+                        _ => *canon == receipt.claim.value,
                     };
                     Check {
                         name: CheckName::ValueMatch,
@@ -365,16 +428,11 @@ pub fn verify_in(ctx: &SourceContext, receipt: &Receipt) -> VerificationReport {
                 None => Check {
                     name: CheckName::ValueMatch,
                     pass: false,
-                    detail: Some("located fact is not numeric".into()),
+                    detail: Some("located fact has no re-derivable numeric value".into()),
                 },
-            },
-            _ => Check {
-                name: CheckName::ValueMatch,
-                pass: false,
-                detail: Some("located fact failed normalization".into()),
-            },
-        };
-        checks.push(value_check);
+            };
+            checks.push(value_check);
+        }
     }
 
     let status = if checks.iter().all(|c| c.pass) {
@@ -397,18 +455,11 @@ pub fn verify(receipt: &Receipt, source_bytes: &[u8]) -> VerificationReport {
         Err(e) => VerificationReport {
             receipt_id: receipt.receipt_id.clone(),
             status: ValidationStatus::Failed,
-            checks: vec![
-                Check {
-                    name: CheckName::ArtifactHash,
-                    pass: sha256_hex(source_bytes) == receipt.evidence[0].source_artifact.sha256,
-                    detail: None,
-                },
-                Check {
-                    name: CheckName::Locate,
-                    pass: false,
-                    detail: Some(format!("source re-parse failed: {e}")),
-                },
-            ],
+            checks: vec![Check {
+                name: CheckName::Locate,
+                pass: false,
+                detail: Some(format!("source re-parse failed: {e}")),
+            }],
         },
     }
 }

@@ -36,9 +36,12 @@ fn builds_receipt_for_numeric_fact() {
     assert!(r.receipt_id.starts_with("er_"));
     assert_eq!(r.claim.kind, ClaimKind::Stated);
     assert_eq!(r.claim.value, "50684952000000");
-    assert_eq!(r.evidence[0].locator.concept, "jppfs_cor:NetSales");
-    assert_eq!(r.evidence[0].locator.context_ref, "CurrentYearDuration");
-    assert!(r.evidence[0].locator.byte_range.is_some());
+    assert_eq!(r.evidence[0].locator.xbrl().concept, "jppfs_cor:NetSales");
+    assert_eq!(
+        r.evidence[0].locator.xbrl().context_ref,
+        "CurrentYearDuration"
+    );
+    assert!(r.evidence[0].locator.xbrl().byte_range.is_some());
 }
 
 #[test]
@@ -110,7 +113,7 @@ fn verify_fails_when_fact_not_locatable() {
     let bytes = INSTANCE.as_bytes();
     let doc = parse_instance(bytes).unwrap();
     let mut receipts = build_receipts(&doc, "S100Y8NY", &artifact(bytes)).unwrap();
-    receipts[0].evidence[0].locator.context_ref = "NoSuchContext".into();
+    receipts[0].evidence[0].locator.xbrl_mut().context_ref = "NoSuchContext".into();
     let report = verify(&receipts[0], bytes);
     assert_eq!(report.status, ValidationStatus::Failed);
     let loc = report
@@ -148,4 +151,64 @@ fn duplicate_facts_disambiguate_by_byte_range() {
         let report = verify(r, bytes);
         assert_eq!(report.status, ValidationStatus::Verified, "{report:?}");
     }
+}
+
+#[test]
+fn tampered_receipt_id_binding_fails() {
+    // claim を別の正当な値に書き換えても receipt_id が旧いままなら FAIL
+    // (原本上は成立する claim へのすり替え攻撃を receipt_id 検証で塞ぐ)
+    let bytes = INSTANCE.as_bytes();
+    let doc = parse_instance(bytes).unwrap();
+    let mut receipts = build_receipts(&doc, "S100Y8NY", &artifact(bytes)).unwrap();
+    receipts[0].claim.doc_id = "S999FORGED".into();
+    let report = verify(&receipts[0], bytes);
+    assert_eq!(report.status, ValidationStatus::Failed);
+    let id = report
+        .checks
+        .iter()
+        .find(|c| c.name == CheckName::ReceiptId)
+        .unwrap();
+    assert!(!id.pass);
+}
+
+#[test]
+fn empty_evidence_fails_loudly_not_panics() {
+    let bytes = INSTANCE.as_bytes();
+    let doc = parse_instance(bytes).unwrap();
+    let mut receipts = build_receipts(&doc, "S100Y8NY", &artifact(bytes)).unwrap();
+    receipts[0].evidence.clear();
+    let report = verify(&receipts[0], bytes);
+    assert_eq!(report.status, ValidationStatus::Failed);
+    let shape = report
+        .checks
+        .iter()
+        .find(|c| c.name == CheckName::EvidenceShape)
+        .unwrap();
+    assert!(!shape.pass);
+}
+
+#[test]
+fn trailing_forged_evidence_fails() {
+    // M1 は evidence ちょうど1件のみ許可 — 2件目の紛れ込みは形状違反
+    let bytes = INSTANCE.as_bytes();
+    let doc = parse_instance(bytes).unwrap();
+    let mut receipts = build_receipts(&doc, "S100Y8NY", &artifact(bytes)).unwrap();
+    let dup = receipts[0].evidence[0].clone();
+    receipts[0].evidence.push(dup);
+    let report = verify(&receipts[0], bytes);
+    assert_eq!(report.status, ValidationStatus::Failed);
+}
+
+#[test]
+fn locator_serializes_with_profile_tag() {
+    let bytes = INSTANCE.as_bytes();
+    let doc = parse_instance(bytes).unwrap();
+    let receipts = build_receipts(&doc, "S100Y8NY", &artifact(bytes)).unwrap();
+    let json = serde_json::to_value(&receipts[0]).unwrap();
+    assert_eq!(json["schema"], "er/0.1");
+    assert_eq!(json["evidence"][0]["locator"]["profile"], "xbrl");
+    assert!(
+        receipts[0].receipt_id.len() > 20,
+        "full digest, not truncated"
+    );
 }

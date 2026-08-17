@@ -76,7 +76,7 @@ enum Commands {
     },
     /// Deterministically verify evidence receipts against source bytes
     Verify {
-        /// Path to a receipt JSON/JSONL file
+        /// Path to a receipts JSONL file (one receipt object per line)
         receipts: PathBuf,
 
         /// Path to the source XBRL instance the receipts cite
