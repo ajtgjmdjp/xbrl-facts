@@ -28,6 +28,10 @@ pub enum EvidenceError {
     Parse(String),
     #[error("receipt serialization failed: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error("derivation failed: {0}")]
+    Derivation(String),
+    #[error("signing failed: {0}")]
+    Signing(String),
 }
 
 // --- Horizontal core types ---
@@ -101,6 +105,8 @@ pub struct Evidence {
 pub enum ClaimKind {
     /// The value as stated in the source document.
     Stated,
+    /// A value computed from other receipts via a deterministic operation.
+    Derived,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -115,6 +121,94 @@ pub struct Claim {
     pub doc_id: String,
 }
 
+/// Deterministic operations over parent receipt values. Rounding uses
+/// MidpointAwayFromZero and is part of the recorded operation, so the
+/// verifier reproduces the exact same result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Operation {
+    /// inputs[0] / inputs[1]
+    Ratio { round_dp: Option<u32> },
+    /// inputs[0] - inputs[1]
+    Difference,
+    /// (inputs[0] - inputs[1]) / |inputs[1]| — abs denominator so that a
+    /// shrinking loss reads as positive growth.
+    GrowthRate { round_dp: Option<u32> },
+}
+
+impl Operation {
+    fn round(v: Decimal, dp: Option<u32>) -> Decimal {
+        match dp {
+            Some(dp) => {
+                v.round_dp_with_strategy(dp, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
+            }
+            None => v,
+        }
+        .normalize()
+    }
+
+    pub fn apply(&self, inputs: &[Decimal]) -> Result<Decimal, EvidenceError> {
+        let need = match self {
+            Operation::Ratio { .. } | Operation::Difference | Operation::GrowthRate { .. } => 2,
+        };
+        if inputs.len() != need {
+            return Err(EvidenceError::Derivation(format!(
+                "operation needs {need} inputs, got {}",
+                inputs.len()
+            )));
+        }
+        match self {
+            Operation::Ratio { round_dp } => {
+                if inputs[1].is_zero() {
+                    return Err(EvidenceError::Derivation("division by zero".into()));
+                }
+                Ok(Self::round(inputs[0] / inputs[1], *round_dp))
+            }
+            Operation::Difference => Ok((inputs[0] - inputs[1]).normalize()),
+            Operation::GrowthRate { round_dp } => {
+                if inputs[1].is_zero() {
+                    return Err(EvidenceError::Derivation("division by zero".into()));
+                }
+                Ok(Self::round(
+                    (inputs[0] - inputs[1]) / inputs[1].abs(),
+                    *round_dp,
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DerivationInput {
+    /// Content-hash id of the parent receipt.
+    pub receipt_id: String,
+    /// The parent's claimed value as consumed (canonical decimal string).
+    pub value: String,
+    /// Role in the operation (e.g. "numerator", "denominator").
+    pub role: String,
+}
+
+/// First-class lineage for derived claims — inputs and parameters live
+/// here, never overloaded into `evidence`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct Derivation {
+    pub operation: Operation,
+    pub inputs: Vec<DerivationInput>,
+}
+
+/// Detached endorsement over the canonical receipt body. Excluded from
+/// the receipt_id hash: the id names the content, the attestation vouches
+/// for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct Attestation {
+    pub alg: String,
+    pub public_key: String,
+    pub sig: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Receipt {
@@ -123,14 +217,35 @@ pub struct Receipt {
     pub receipt_id: String,
     pub claim: Claim,
     pub evidence: Vec<Evidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derivation: Option<Derivation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<Attestation>,
 }
 
-pub const SCHEMA_VERSION: &str = "er/0.1";
+pub const SCHEMA_VERSION: &str = "er/0.2";
 
 /// Content-derived id over the canonical body. Full digest — the id is an
 /// audit reference and (in M2) a signing subject, so no truncation.
-fn receipt_id_for(claim: &Claim, evidence: &[Evidence]) -> Result<String, EvidenceError> {
-    let body = serde_json::to_string(&(SCHEMA_VERSION, claim, evidence))?;
+fn canonical_body(
+    claim: &Claim,
+    evidence: &[Evidence],
+    derivation: &Option<Derivation>,
+) -> Result<String, EvidenceError> {
+    Ok(serde_json::to_string(&(
+        SCHEMA_VERSION,
+        claim,
+        evidence,
+        derivation,
+    ))?)
+}
+
+fn receipt_id_for(
+    claim: &Claim,
+    evidence: &[Evidence],
+    derivation: &Option<Derivation>,
+) -> Result<String, EvidenceError> {
+    let body = canonical_body(claim, evidence, derivation)?;
     Ok(format!("er_{}", sha256_hex(body.as_bytes())))
 }
 
@@ -151,6 +266,12 @@ pub enum CheckName {
     ByteRange,
     /// The located fact's normalized value equals the claimed value.
     ValueMatch,
+    /// Every derivation input resolves to a known, self-consistent parent.
+    InputResolution,
+    /// Re-applying the recorded operation reproduces the claimed value.
+    Recompute,
+    /// The attestation signature is valid over the canonical body.
+    Attestation,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -252,12 +373,14 @@ pub fn build_receipts(
             },
         }];
 
-        let receipt_id = receipt_id_for(&claim, &evidence)?;
+        let receipt_id = receipt_id_for(&claim, &evidence, &None)?;
         receipts.push(Receipt {
             schema: SCHEMA_VERSION.to_string(),
             receipt_id,
             claim,
             evidence,
+            derivation: None,
+            attestation: None,
         });
     }
     Ok(receipts)
@@ -342,7 +465,7 @@ pub fn verify_in(ctx: &SourceContext, receipt: &Receipt) -> VerificationReport {
     // Without this, a tampered receipt could point at a different (valid)
     // fact and still report Verified.
     let id_ok = matches!(
-        receipt_id_for(&receipt.claim, &receipt.evidence),
+        receipt_id_for(&receipt.claim, &receipt.evidence, &receipt.derivation),
         Ok(expected) if expected == receipt.receipt_id && receipt.schema == SCHEMA_VERSION
     );
     checks.push(Check {
@@ -435,6 +558,10 @@ pub fn verify_in(ctx: &SourceContext, receipt: &Receipt) -> VerificationReport {
         }
     }
 
+    if let Some(check) = attestation_check(receipt) {
+        checks.push(check);
+    }
+
     let status = if checks.iter().all(|c| c.pass) {
         ValidationStatus::Verified
     } else {
@@ -462,4 +589,217 @@ pub fn verify(receipt: &Receipt, source_bytes: &[u8]) -> VerificationReport {
             }],
         },
     }
+}
+
+// --- Derived claims (M2) ---
+
+/// Build a derived receipt from parent receipts. The operation is applied
+/// to the parents' claimed values in the given order; each input records
+/// the parent id, the exact value consumed, and its role.
+pub fn build_derived_receipt(
+    operation: Operation,
+    parents: &[(&Receipt, &str)],
+    doc_id: &str,
+) -> Result<Receipt, EvidenceError> {
+    let values: Vec<Decimal> = parents
+        .iter()
+        .map(|(p, _)| {
+            p.claim
+                .value
+                .parse::<Decimal>()
+                .map_err(|e| EvidenceError::Derivation(format!("parent value not decimal: {e}")))
+        })
+        .collect::<Result<_, _>>()?;
+    let result = operation.apply(&values)?;
+
+    let claim = Claim {
+        value: result.to_string(),
+        unit: None,
+        kind: ClaimKind::Derived,
+        doc_id: doc_id.to_string(),
+    };
+    let derivation = Some(Derivation {
+        operation,
+        inputs: parents
+            .iter()
+            .map(|(p, role)| DerivationInput {
+                receipt_id: p.receipt_id.clone(),
+                value: p.claim.value.clone(),
+                role: (*role).to_string(),
+            })
+            .collect(),
+    });
+    let receipt_id = receipt_id_for(&claim, &[], &derivation)?;
+    Ok(Receipt {
+        schema: SCHEMA_VERSION.to_string(),
+        receipt_id,
+        claim,
+        evidence: Vec::new(),
+        derivation,
+        attestation: None,
+    })
+}
+
+/// Verify a derived receipt against its parents.
+///
+/// The chain to primary sources is completed by verifying each stated
+/// parent with [`verify_in`]; this function checks the derivation link:
+/// parent resolution, parent self-consistency, and recomputation.
+pub fn verify_derived(
+    receipt: &Receipt,
+    parents: &std::collections::HashMap<String, &Receipt>,
+) -> VerificationReport {
+    let mut checks = Vec::new();
+
+    let id_ok = matches!(
+        receipt_id_for(&receipt.claim, &receipt.evidence, &receipt.derivation),
+        Ok(expected) if expected == receipt.receipt_id && receipt.schema == SCHEMA_VERSION
+    );
+    checks.push(Check {
+        name: CheckName::ReceiptId,
+        pass: id_ok,
+        detail: (!id_ok).then(|| "receipt body does not hash to receipt_id".into()),
+    });
+
+    let shape_ok = receipt.claim.kind == ClaimKind::Derived
+        && receipt.evidence.is_empty()
+        && receipt
+            .derivation
+            .as_ref()
+            .is_some_and(|d| !d.inputs.is_empty());
+    checks.push(Check {
+        name: CheckName::EvidenceShape,
+        pass: shape_ok,
+        detail: (!shape_ok).then(|| {
+            "derived receipt must have kind=derived, empty evidence, non-empty derivation".into()
+        }),
+    });
+
+    if let Some(derivation) = &receipt.derivation {
+        // Inputs resolve to known parents whose bodies are self-consistent
+        // and whose claimed values match what this derivation consumed.
+        let mut failures = Vec::new();
+        let mut values = Vec::new();
+        for input in &derivation.inputs {
+            match parents.get(&input.receipt_id) {
+                None => failures.push(format!("{}: unknown parent", input.receipt_id)),
+                Some(parent) => {
+                    let parent_ok = matches!(
+                        receipt_id_for(&parent.claim, &parent.evidence, &parent.derivation),
+                        Ok(expected) if expected == parent.receipt_id
+                    );
+                    if !parent_ok {
+                        failures.push(format!("{}: parent fails integrity", input.receipt_id));
+                    } else if parent.claim.value != input.value {
+                        failures.push(format!(
+                            "{}: consumed {} but parent claims {}",
+                            input.receipt_id, input.value, parent.claim.value
+                        ));
+                    }
+                }
+            }
+            if let Ok(v) = input.value.parse::<Decimal>() {
+                values.push(v);
+            }
+        }
+        let res_ok = failures.is_empty();
+        checks.push(Check {
+            name: CheckName::InputResolution,
+            pass: res_ok,
+            detail: (!res_ok).then(|| failures.join("; ")),
+        });
+
+        // Recompute from the recorded inputs
+        let recompute = match derivation.operation.apply(&values) {
+            Ok(v) => {
+                let claim_dec = receipt.claim.value.parse::<Decimal>().ok();
+                let pass = claim_dec.map(|c| c == v).unwrap_or(false);
+                Check {
+                    name: CheckName::Recompute,
+                    pass,
+                    detail: (!pass)
+                        .then(|| format!("recomputed {v}, claimed {}", receipt.claim.value)),
+                }
+            }
+            Err(e) => Check {
+                name: CheckName::Recompute,
+                pass: false,
+                detail: Some(format!("recompute failed: {e}")),
+            },
+        };
+        checks.push(recompute);
+    }
+
+    if let Some(check) = attestation_check(receipt) {
+        checks.push(check);
+    }
+
+    let status = if checks.iter().all(|c| c.pass) {
+        ValidationStatus::Verified
+    } else {
+        ValidationStatus::Failed
+    };
+    VerificationReport {
+        receipt_id: receipt.receipt_id.clone(),
+        status,
+        checks,
+    }
+}
+
+// --- Signing (M2) ---
+
+/// Ed25519 signing key for receipt attestations.
+pub struct SigningKey(ed25519_dalek::SigningKey);
+
+impl SigningKey {
+    pub fn generate() -> Self {
+        Self(ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng))
+    }
+
+    pub fn from_bytes(bytes: &[u8; 32]) -> Self {
+        Self(ed25519_dalek::SigningKey::from_bytes(bytes))
+    }
+
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
+}
+
+/// Sign the canonical receipt body. The signature covers exactly the bytes
+/// the receipt_id hashes — id names the content, attestation vouches for it.
+pub fn sign_receipt(receipt: &mut Receipt, key: &SigningKey) -> Result<(), EvidenceError> {
+    use ed25519_dalek::Signer;
+    let body = canonical_body(&receipt.claim, &receipt.evidence, &receipt.derivation)?;
+    let sig = key.0.sign(body.as_bytes());
+    receipt.attestation = Some(Attestation {
+        alg: "ed25519".into(),
+        public_key: hex::encode(key.0.verifying_key().to_bytes()),
+        sig: hex::encode(sig.to_bytes()),
+    });
+    Ok(())
+}
+
+/// Attestation check, or None when the receipt is unsigned.
+fn attestation_check(receipt: &Receipt) -> Option<Check> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let att = receipt.attestation.as_ref()?;
+    let pass = (|| {
+        if att.alg != "ed25519" {
+            return Some(false);
+        }
+        let pk: [u8; 32] = hex::decode(&att.public_key).ok()?.try_into().ok()?;
+        let sig: [u8; 64] = hex::decode(&att.sig).ok()?.try_into().ok()?;
+        let body = canonical_body(&receipt.claim, &receipt.evidence, &receipt.derivation).ok()?;
+        let key = VerifyingKey::from_bytes(&pk).ok()?;
+        Some(
+            key.verify(body.as_bytes(), &Signature::from_bytes(&sig))
+                .is_ok(),
+        )
+    })()
+    .unwrap_or(false);
+    Some(Check {
+        name: CheckName::Attestation,
+        pass,
+        detail: (!pass).then(|| "signature invalid over canonical body".into()),
+    })
 }

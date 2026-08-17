@@ -74,6 +74,25 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Generate an ed25519 signing key (32-byte hex file)
+    Keygen {
+        /// Output key file
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Sign receipts with an ed25519 key (attestation over canonical body)
+    Sign {
+        /// Path to a receipts JSONL file
+        receipts: PathBuf,
+
+        /// Path to a 32-byte hex key file (see keygen)
+        #[arg(long)]
+        key: PathBuf,
+
+        /// Output file (default: in-place)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Deterministically verify evidence receipts against source bytes
     Verify {
         /// Path to a receipts JSONL file (one receipt object per line)
@@ -228,15 +247,45 @@ fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("failed to read receipts {}", receipts.display()))?;
             let ctx = xbrl_facts_evidence::SourceContext::load(&source_bytes)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let all: Vec<xbrl_facts_evidence::Receipt> = text
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(serde_json::from_str)
+                .collect::<Result<_, _>>()?;
+            let parents: std::collections::HashMap<String, &xbrl_facts_evidence::Receipt> =
+                all.iter().map(|r| (r.receipt_id.clone(), r)).collect();
+
             let mut pass = 0usize;
             let mut fail = 0usize;
-            for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                let receipt: xbrl_facts_evidence::Receipt = serde_json::from_str(line)?;
-                let report = xbrl_facts_evidence::verify_in(&ctx, &receipt);
+            let mut verified_ids = std::collections::HashSet::new();
+            // Stated first, so derived receipts can require verified parents
+            for receipt in all.iter().filter(|r| r.derivation.is_none()) {
+                let report = xbrl_facts_evidence::verify_in(&ctx, receipt);
                 if report.status == xbrl_facts_evidence::ValidationStatus::Verified {
                     pass += 1;
+                    verified_ids.insert(receipt.receipt_id.clone());
                 } else {
                     fail += 1;
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+            }
+            for receipt in all.iter().filter(|r| r.derivation.is_some()) {
+                let report = xbrl_facts_evidence::verify_derived(receipt, &parents);
+                // Chain rule: a derived claim is only as good as its parents'
+                // verification against the primary source.
+                let chain_ok = receipt.derivation.as_ref().is_some_and(|d| {
+                    d.inputs
+                        .iter()
+                        .all(|i| verified_ids.contains(&i.receipt_id))
+                });
+                if report.status == xbrl_facts_evidence::ValidationStatus::Verified && chain_ok {
+                    pass += 1;
+                    verified_ids.insert(receipt.receipt_id.clone());
+                } else {
+                    fail += 1;
+                    if !chain_ok {
+                        eprintln!("{}: parent(s) not source-verified", receipt.receipt_id);
+                    }
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 }
             }
@@ -244,6 +293,46 @@ fn main() -> anyhow::Result<()> {
             if fail > 0 {
                 std::process::exit(1);
             }
+        }
+        Commands::Keygen { output } => {
+            let key = xbrl_facts_evidence::SigningKey::generate();
+            std::fs::write(&output, hex::encode(key.to_bytes()))
+                .with_context(|| format!("failed to write {}", output.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600))?;
+            }
+            eprintln!("key written to {}", output.display());
+        }
+        Commands::Sign {
+            receipts,
+            key,
+            output,
+        } => {
+            let hex_key = std::fs::read_to_string(&key)
+                .with_context(|| format!("failed to read key {}", key.display()))?;
+            let bytes: [u8; 32] = hex::decode(hex_key.trim())
+                .map_err(|e| anyhow::anyhow!("bad key hex: {e}"))?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("key must be 32 bytes"))?;
+            let signer = xbrl_facts_evidence::SigningKey::from_bytes(&bytes);
+            let text = std::fs::read_to_string(&receipts)
+                .with_context(|| format!("failed to read receipts {}", receipts.display()))?;
+            let mut out = String::new();
+            let mut n = 0usize;
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                let mut receipt: xbrl_facts_evidence::Receipt = serde_json::from_str(line)?;
+                xbrl_facts_evidence::sign_receipt(&mut receipt, &signer)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                out.push_str(&serde_json::to_string(&receipt)?);
+                out.push('\n');
+                n += 1;
+            }
+            let dest = output.unwrap_or(receipts);
+            std::fs::write(&dest, out)
+                .with_context(|| format!("failed to write {}", dest.display()))?;
+            eprintln!("{n} receipts signed -> {}", dest.display());
         }
         Commands::Inspect { path, concept } => {
             let input = std::fs::read_to_string(&path)

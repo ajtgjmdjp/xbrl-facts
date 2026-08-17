@@ -205,7 +205,7 @@ fn locator_serializes_with_profile_tag() {
     let doc = parse_instance(bytes).unwrap();
     let receipts = build_receipts(&doc, "S100Y8NY", &artifact(bytes)).unwrap();
     let json = serde_json::to_value(&receipts[0]).unwrap();
-    assert_eq!(json["schema"], "er/0.1");
+    assert_eq!(json["schema"], xbrl_facts_evidence::SCHEMA_VERSION);
     assert_eq!(json["evidence"][0]["locator"]["profile"], "xbrl");
     assert!(
         receipts[0].receipt_id.len() > 20,
